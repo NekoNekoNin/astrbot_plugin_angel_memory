@@ -2,6 +2,9 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
+
+from ..llm_memory.utils.note_scope import require_session_scope
 
 from astrbot.api import FunctionTool
 from astrbot.api.event import AstrMessageEvent
@@ -17,7 +20,7 @@ except ImportError:
 class NoteCreateTool(FunctionTool):
     name: str = "angel_note_create"
     description: str = (
-        "把成体系的知识整理成一篇 Markdown 笔记并永久存档（自动纳入知识库，之后可检索）。"
+        "把成体系的知识整理成当前会话专属的 Markdown 笔记并永久存档，之后仅此会话可检索。"
         "两种时机会想写笔记：一是用户明确要求你记笔记、整理资料、写总结时（必须写）；"
         "二是当你在学习或交流中积累了不少心得、值得沉淀下来时，可以主动写一篇。"
         "用多级标题（#/##）分节组织，方便日后按段检索与展开。"
@@ -63,6 +66,10 @@ class NoteCreateTool(FunctionTool):
         if not hasattr(event, "plugin_context") or event.plugin_context is None:
             return "错误：无法获取插件上下文。"
         plugin_context = event.plugin_context
+        try:
+            memory_scope = require_session_scope(await plugin_context.resolve_memory_scope_from_event(event))
+        except Exception:
+            return "错误：无法确定当前会话，笔记写入已拒绝。"
 
         note_service = plugin_context.get_component("note_service")
         if note_service is None:
@@ -77,11 +84,11 @@ class NoteCreateTool(FunctionTool):
         # 文件名：安全标题 + 当地时间戳（精确到秒）
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_title = self._sanitize_title(title)
-        filename = f"{safe_title}_{timestamp}.md"
+        filename = f"{safe_title}_{timestamp}_{uuid4().hex[:12]}.md"
 
         # AI 自主生成的笔记统一存放在 raw/.angel/note/，与用户手动放入的文件区分开
-        rel_dir = ".angel/note"
-        notes_dir = Path(raw_dir) / ".angel" / "note"
+        rel_dir = f".angel/note/{memory_scope}"
+        notes_dir = Path(raw_dir) / ".angel" / "note" / memory_scope
         notes_dir.mkdir(parents=True, exist_ok=True)
         target_path = notes_dir / filename
         relative_path = f"{rel_dir}/{filename}"
@@ -101,7 +108,8 @@ class NoteCreateTool(FunctionTool):
         try:
             import asyncio
             await asyncio.to_thread(
-                note_service.parse_and_store_file_sync, str(target_path), relative_path
+                note_service.parse_and_store_file_sync, str(target_path), relative_path,
+                memory_scope=memory_scope,
             )
         except Exception as e:
             self.logger.warning(f"{self.name}: 笔记已写入但索引同步失败（稍后扫描会补上）: {e}", exc_info=True)

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 
 from ..llm_memory.models.data_models import BaseMemory
 from ..core.utils.memory_formatter import MemoryFormatter
+from ..llm_memory.utils.note_scope import require_session_scope
 
 try:
     from astrbot.api import logger
@@ -60,9 +61,7 @@ class CoreMemoryRecallTool(FunctionTool):
             memory_runtime = plugin_context.get_component("memory_runtime")
             if not memory_runtime:
                 raise ValueError("memory_runtime 未注册。")
-            memory_scope = await plugin_context.resolve_memory_scope_from_event(event)
-            if not isinstance(memory_scope, str):
-                memory_scope = str(memory_scope)
+            memory_scope = require_session_scope(await plugin_context.resolve_memory_scope_from_event(event))
         except Exception as e:
             self.logger.error(f"{self.name}: 获取上下文失败: {e}")
             return "错误：无法确定当前会话，检索已拒绝。"
@@ -95,7 +94,7 @@ class CoreMemoryRecallTool(FunctionTool):
         try:
             note_service = plugin_context.get_component("note_service")
             if note_service:
-                note_results = await note_service.search_notes(query=query, max_results=50)
+                note_results = await note_service.search_notes(query=query, max_results=50, memory_scope=memory_scope)
                 # 精准过滤：content 必须包含原始查询词
                 if note_results:
                     note_results = self._precise_filter(note_results, query)

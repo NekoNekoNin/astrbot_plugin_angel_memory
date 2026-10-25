@@ -214,50 +214,14 @@ def test_merge_memories_allows_single_source_replacement():
     assert len(store.saved_memories) == 1
 
 
-def test_sql_merge_action_allows_single_source_replacement():
-    manager = MemorySqlManager.__new__(MemorySqlManager)
-    manager._lock = threading.RLock()
-    manager._tag_names = set()
-
-    lookup_calls = []
-    sync_calls = {}
-
-    def fake_get_memories(source_ids):
-        lookup_calls.append(list(source_ids))
-        return [
-            BaseMemory(
-                id="m1",
-                memory_type=MemoryType.KNOWLEDGE,
-                judgment="用户使用旧版反馈协议。",
-                reasoning="旧记忆。",
-                tags=["旧协议", "反馈结构"],
-                strength=2,
-                created_at=1_700_000_000.0,
-                memory_scope="public",
-            )
-        ]
-
-    class _FakeConnection:
-        def execute(self, *args, **kwargs):
-            return None
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-    manager._get_memories_by_ids_sync = fake_get_memories
-    manager._upsert_tags_and_bind = lambda conn, memory_id, tags: None
-    manager._sync_memory_fts_batch_sync = (
-        lambda upsert_ids=None, delete_ids=None: sync_calls.update(
-            {"upsert_ids": upsert_ids, "delete_ids": delete_ids}
-        )
+def test_sql_merge_action_allows_single_source_replacement(tmp_path):
+    manager = MemorySqlManager(tmp_path / "feedback.db")
+    old = manager._remember_sync(
+        "knowledge", "用户使用旧版反馈协议。", "旧记忆。", ["旧协议", "反馈结构"],
+        strength=2, memory_scope="public",
     )
-    manager._connect = lambda: _FakeConnection()
-
     merged = manager._merge_action_sync(
-        ["m1"],
+        [old.id],
         {
             "type": "knowledge",
             "judgment": "用户要求所有记忆反馈统一采用 memory_actions 协议。",
@@ -266,12 +230,11 @@ def test_sql_merge_action_allows_single_source_replacement():
         },
         "public",
     )
-
-    assert lookup_calls == [["m1"]]
     assert merged is not None
     assert merged.strength == 2
     assert merged.judgment == "用户要求所有记忆反馈统一采用 memory_actions 协议。"
-    assert sync_calls["delete_ids"] == ["m1"]
+    assert manager._get_memories_by_ids_sync([old.id]) == []
+    assert manager._get_memories_by_ids_sync([merged.id])[0].judgment == merged.judgment
 
 
 def test_sql_updata_action_reuses_merge_path():
@@ -284,10 +247,11 @@ def test_sql_updata_action_reuses_merge_path():
 
     called = {}
 
-    def fake_merge_action_sync(source_memory_ids, memory_data, resolved_scope):
+    def fake_merge_action_sync(source_memory_ids, memory_data, resolved_scope, history_action=None):
         called["source_memory_ids"] = source_memory_ids
         called["memory_data"] = memory_data
         called["resolved_scope"] = resolved_scope
+        called["history_action"] = history_action
         return BaseMemory(
             id="new1",
             memory_type=MemoryType.KNOWLEDGE,
@@ -324,3 +288,4 @@ def test_sql_updata_action_reuses_merge_path():
     assert len(created) == 1
     assert called["source_memory_ids"] == ["m1"]
     assert called["resolved_scope"] == "public"
+    assert called["history_action"] == "update"

@@ -21,12 +21,14 @@ def register_all_routes(context: "Context", plugin_context, plugin=None) -> None
     from .tags_api import TagsAPI
     from .maintenance_api import MaintenanceAPI
     from .profile_api import ProfileAPI
+    from .history_api import HistoryAPI
 
     memory_api = MemoryAPI(plugin_context)
     notes_api = NotesAPI(plugin_context)
     tags_api = TagsAPI(plugin_context)
     maintenance_api = MaintenanceAPI(plugin_context)
     profile_api = ProfileAPI(plugin_context)
+    history_api = HistoryAPI(plugin_context)
     from .debug_api import DebugAPI
 
     debug_api = DebugAPI(plugin_context)
@@ -40,6 +42,8 @@ def register_all_routes(context: "Context", plugin_context, plugin=None) -> None
         # 记忆
         (f"/{PLUGIN_NAME}/memories", memory_api.browse_memories, ["GET"], "浏览记忆"),
         (f"/{PLUGIN_NAME}/memories/delete", memory_api.delete_memory, ["POST"], "删除记忆"),
+        (f"/{PLUGIN_NAME}/history", history_api.list_records, ["GET"], "学习变更记录"),
+        (f"/{PLUGIN_NAME}/history/undo", history_api.undo, ["POST"], "安全撤销单次学习"),
         # 标签
         (f"/{PLUGIN_NAME}/tags", tags_api.get_tags, ["GET"], "全局标签列表"),
         (f"/{PLUGIN_NAME}/tags/hit-search", tags_api.hit_search, ["POST"], "标签命中搜索"),

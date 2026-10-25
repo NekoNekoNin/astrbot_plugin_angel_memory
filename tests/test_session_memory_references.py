@@ -105,10 +105,15 @@ class _Runtime:
                 continue
             if memory_scope == "public" and memory.memory_scope != "public":
                 continue
-            if memory_scope and memory_scope != "public" and memory.memory_scope not in {
-                memory_scope,
-                "public",
-            }:
+            if (
+                memory_scope
+                and memory_scope != "public"
+                and memory.memory_scope
+                not in {
+                    memory_scope,
+                    "public",
+                }
+            ):
                 continue
             result.append(memory)
         return result
@@ -172,7 +177,9 @@ async def test_injection_hydrates_latest_memory_and_removes_missing_refs():
         ],
     )
 
-    request = types.SimpleNamespace(contexts=[], extra_user_content_parts=[], system_prompt="")
+    request = types.SimpleNamespace(
+        contexts=[], extra_user_content_parts=[], system_prompt=""
+    )
     await DeepMindInjectionService(deepmind).inject_memories_to_request(
         request=request,
         session_id="s1",
@@ -195,7 +202,9 @@ async def test_injection_always_uses_no_save_contexts_even_with_secretary_decisi
     deepmind = _DeepMind(_Runtime([latest]))
     deepmind.session_memory_manager.add_memories_to_session("s1", [latest])
 
-    request = types.SimpleNamespace(contexts=[], extra_user_content_parts=[], system_prompt="")
+    request = types.SimpleNamespace(
+        contexts=[], extra_user_content_parts=[], system_prompt=""
+    )
     await DeepMindInjectionService(deepmind).inject_memories_to_request(
         request=request,
         session_id="s1",
@@ -231,7 +240,7 @@ async def test_simple_runtime_get_memories_by_ids_keeps_order_and_scope():
     private = _memory("private", "私有记忆。", memory_scope="scope-a")
 
     class Manager:
-        async def get_memories_by_ids(self, memory_ids):
+        async def get_memories_by_ids(self, memory_ids, memory_scope=None):
             return [private, public]
 
     runtime = SimpleMemoryRuntime(Manager())
@@ -242,7 +251,7 @@ async def test_simple_runtime_get_memories_by_ids_keeps_order_and_scope():
             ["public", "private"],
             memory_scope="scope-a",
         )
-    ] == ["public", "private"]
+    ] == ["private"]
     assert [
         memory.id
         for memory in await runtime.get_memories_by_ids(

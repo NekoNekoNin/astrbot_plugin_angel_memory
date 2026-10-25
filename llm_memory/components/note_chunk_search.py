@@ -173,7 +173,8 @@ class NoteChunkSearchEngine:
         rerank_max_docs: int | None = None,
         rerank_max_tokens_per_doc: int | None = None,
     ):
-        self._index_dir = Path(index_dir) / "tantivy_note_chunks"
+        # 新 schema 单独建索引；旧索引保留，不把无归属数据当作会话记忆。
+        self._index_dir = Path(index_dir) / "tantivy_note_chunks_scoped_v2"
         self._index_dir.mkdir(parents=True, exist_ok=True)
         self._rerank_provider = rerank_provider
         try:
@@ -205,6 +206,7 @@ class NoteChunkSearchEngine:
         # 存储字段
         builder.add_text_field("file_id", stored=True, tokenizer_name="raw")
         builder.add_text_field("source_file_path", stored=True, tokenizer_name="raw")
+        builder.add_text_field("memory_scope", stored=True, tokenizer_name="raw")
         builder.add_unsigned_field("chunk_index", stored=True, indexed=True)
         builder.add_unsigned_field("line_start", stored=True, indexed=True)
         builder.add_unsigned_field("line_end", stored=True, indexed=True)
@@ -262,7 +264,7 @@ class NoteChunkSearchEngine:
     # 索引写入
     # ============================================================
 
-    def index_chunks(self, file_id: str, source_file_path: str, chunks: List[Dict]) -> int:
+    def index_chunks(self, file_id: str, source_file_path: str, chunks: List[Dict], *, memory_scope: str = "legacy_unattributed") -> int:
         """
         为一个文件的切片建立索引（先删旧再写新）。
 
@@ -293,6 +295,7 @@ class NoteChunkSearchEngine:
                 doc = tantivy.Document()
                 doc.add_text("file_id", file_id)
                 doc.add_text("source_file_path", source_file_path)
+                doc.add_text("memory_scope", memory_scope)
                 doc.add_unsigned("chunk_index", int(chunk.get("chunk_index", 0)))
                 doc.add_unsigned("line_start", int(chunk.get("line_start", 0)))
                 doc.add_unsigned("line_end", int(chunk.get("line_end", 0)))
@@ -346,6 +349,7 @@ class NoteChunkSearchEngine:
                 doc = tantivy.Document()
                 doc.add_text("file_id", file_id)
                 doc.add_text("source_file_path", source_file_path)
+                doc.add_text("memory_scope", str(chunk.get("memory_scope") or "legacy_unattributed"))
                 doc.add_unsigned("chunk_index", int(chunk.get("chunk_index", 0)))
                 doc.add_unsigned("line_start", int(chunk.get("line_start", 0)))
                 doc.add_unsigned("line_end", int(chunk.get("line_end", 0)))
@@ -372,6 +376,7 @@ class NoteChunkSearchEngine:
         query: str,
         limit: int = 20,
         max_chunks_per_file: int = DEFAULT_CHUNKS_PER_FILE,
+        memory_scope: Optional[str] = None,
     ) -> List[Dict]:
         """
         多词搜索：按空格/竖线拆词，每个词独立搜索，合并后按命中词数排序。
@@ -389,7 +394,7 @@ class NoteChunkSearchEngine:
             limit: 最终返回数量
             max_chunks_per_file: 每个文件最多返回的切片数
         """
-        merged = self._search_candidates(query, limit, max_chunks_per_file)
+        merged = self._search_candidates(query, limit, max_chunks_per_file, memory_scope)
         if not merged:
             return []
 
@@ -407,9 +412,10 @@ class NoteChunkSearchEngine:
         query: str,
         limit: int = 20,
         max_chunks_per_file: int = DEFAULT_CHUNKS_PER_FILE,
+        memory_scope: Optional[str] = None,
     ) -> List[Dict]:
         """异步搜索入口，可正确等待异步 rerank_provider。"""
-        merged = self._search_candidates(query, limit, max_chunks_per_file)
+        merged = self._search_candidates(query, limit, max_chunks_per_file, memory_scope)
         if not merged:
             return []
 
@@ -427,6 +433,7 @@ class NoteChunkSearchEngine:
         query: str,
         limit: int,
         max_chunks_per_file: int,
+        memory_scope: Optional[str] = None,
     ) -> List[Dict]:
         """执行 BM25 多级搜索并返回待 rerank 候选。"""
         normalized_query = normalize_search_text(query)
@@ -440,13 +447,13 @@ class NoteChunkSearchEngine:
 
         # 单词直接走原有逻辑
         if len(query_terms) == 1:
-            return self._search_single_term(query_terms[0], limit, max_chunks_per_file)
+            return self._search_single_term(query_terms[0], limit, max_chunks_per_file, memory_scope)
 
         # 多词：每个词独立搜索
         per_term_limit = max(limit * 3, 50)
         term_results: Dict[str, List[Dict]] = {}
         for term in query_terms:
-            results = self._search_single_term(term, per_term_limit, max_chunks_per_file)
+            results = self._search_single_term(term, per_term_limit, max_chunks_per_file, memory_scope)
             term_results[term] = results
 
         # 合并：统计每个切片命中了多少个词
@@ -508,6 +515,7 @@ class NoteChunkSearchEngine:
         term: str,
         limit: int,
         max_chunks_per_file: int,
+        memory_scope: Optional[str] = None,
     ) -> List[Dict]:
         """单词多级搜索（2-gram AND → 1+2-gram OR 降级）+ 后过滤"""
         normalized = normalize_search_text(term)
@@ -537,6 +545,7 @@ class NoteChunkSearchEngine:
             desired_file_count=desired_file_count,
             max_chunks_per_file=max_chunks_per_file,
             stage_rank=0,
+            memory_scope=memory_scope,
         )
 
         # 不够则第二次：1+2-gram OR 补充
@@ -550,6 +559,7 @@ class NoteChunkSearchEngine:
                 desired_file_count=desired_file_count,
                 max_chunks_per_file=max_chunks_per_file,
                 stage_rank=1,
+                memory_scope=memory_scope,
             )
             candidates = self._merge_candidates(
                 candidates, loose_candidates, desired_file_count, max_chunks_per_file
@@ -566,6 +576,7 @@ class NoteChunkSearchEngine:
         desired_file_count: int,
         max_chunks_per_file: int,
         stage_rank: int,
+        memory_scope: Optional[str] = None,
     ) -> List[Dict]:
         """单阶段搜索，自动扩大 hit_limit 直到满足文件数目标"""
         if not query_string:
@@ -573,6 +584,11 @@ class NoteChunkSearchEngine:
 
         fields = ["content_cjk2", "path_cjk2"]
         parsed_query = self._index.parse_query(query_string, fields)
+        if memory_scope is not None:
+            scope_query = tantivy.Query.term_query(self._schema, "memory_scope", memory_scope)
+            parsed_query = tantivy.Query.boolean_query([
+                (tantivy.Occur.Must, parsed_query), (tantivy.Occur.Must, scope_query)
+            ])
         fetch_limit = max(1, hit_limit)
         ceiling = max(fetch_limit, hit_limit_ceiling)
 
@@ -586,6 +602,9 @@ class NoteChunkSearchEngine:
                 doc = searcher.doc(doc_address)
                 file_id = self._doc_first(doc, "file_id")
                 source_file_path = self._doc_first(doc, "source_file_path")
+                owner_scope = self._doc_first(doc, "memory_scope")
+                if memory_scope is not None and owner_scope != memory_scope:
+                    continue
                 chunk_index = self._doc_first_int(doc, "chunk_index")
                 if not file_id:
                     continue
@@ -602,6 +621,7 @@ class NoteChunkSearchEngine:
                 candidates.append({
                     "file_id": file_id,
                     "source_file_path": source_file_path,
+                    "memory_scope": owner_scope,
                     "chunk_index": chunk_index,
                     "line_start": self._doc_first_int(doc, "line_start"),
                     "line_end": self._doc_first_int(doc, "line_end"),

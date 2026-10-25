@@ -18,6 +18,7 @@ from astrbot.api.provider import ProviderRequest
 from .soul.soul_state import SoulState
 from .utils.memory_id_resolver import MemoryIDResolver
 from ..llm_memory.utils.json_parser import JsonParser
+from ..llm_memory.components.memory_history import learning_source
 from .session_memory import SessionMemoryManager
 from .memory_runtime import MemoryRuntime
 from .utils import SmallModelPromptBuilder, MemoryInjector
@@ -28,6 +29,7 @@ from .services.sleep_service import DeepMindSleepService
 from .services.user_profile_service import UserProfileService
 from .utils.feedback_queue import get_feedback_queue
 from .reflection_trace import ReflectionTraceBuffer
+from .important_memory import classify_important_memory
 from .sleep_schedule import seconds_until_next_sleep, should_run_sleep, today_key
 from .trace_store import TraceStore
 
@@ -163,44 +165,53 @@ class DeepMind:
         self._reflection_states: Dict[str, Dict[str, Any]] = {}
         self._reflection_tick_task: Optional[asyncio.Task] = None
         self._reflection_stop_event = asyncio.Event()
+        self._important_memory_immediate = (
+            memory_behavior.get("important_memory_immediate", True) is True
+            if isinstance(memory_behavior, dict)
+            else getattr(config, "important_memory_immediate", True) is True
+        )
         self._reflection_turn_threshold = max(
             1,
             int(
                 (
-                    memory_behavior.get("reflection_turn_threshold", 6)
+                    memory_behavior.get("reflection_turn_threshold", 3)
                     if isinstance(memory_behavior, dict)
-                    else getattr(config, "reflection_turn_threshold", 6)
+                    else getattr(config, "reflection_turn_threshold", 3)
                 )
-                or 6
+                or 3
             ),
         )
         self._reflection_idle_seconds = max(
             1,
             int(
                 (
-                    memory_behavior.get("reflection_idle_seconds", 600)
+                    memory_behavior.get("reflection_idle_seconds", 30)
                     if isinstance(memory_behavior, dict)
-                    else getattr(config, "reflection_idle_seconds", 600)
+                    else getattr(config, "reflection_idle_seconds", 30)
                 )
-                or 600
+                or 30
             ),
         )
         self._reflection_tick_seconds = max(
             10,
             int(
                 (
-                    memory_behavior.get("reflection_tick_seconds", 600)
+                    memory_behavior.get("reflection_tick_seconds", 10)
                     if isinstance(memory_behavior, dict)
-                    else getattr(config, "reflection_tick_seconds", 600)
+                    else getattr(config, "reflection_tick_seconds", 10)
                 )
-                or 600
+                or 10
             ),
         )
 
         # 初始化灵魂状态管理器
         try:
             # 将配置对象传递给 SoulState
-            self.soul = SoulState(config=self.config)
+            self.soul = (
+                SoulState(config=self.config)
+                if bool(getattr(self.config, "enable_soul_system", False))
+                else None
+            )
         except Exception as e:
             self.logger.error(f"灵魂状态管理器初始化失败: {e}")
             self.soul = None
@@ -332,6 +343,8 @@ class DeepMind:
         event.plugin_context = self.plugin_context
 
         session_id = self._get_session_id(event)
+        memory_scope = await self.plugin_context.resolve_memory_scope_from_event(event)
+        current_sender_id, current_sender_name = self._get_event_sender_identity(event)
 
         # 1. 从 event.angelheart_context 中获取对话历史（仅保留未处理消息）
         chat_records: List[Dict[str, Any]] = []
@@ -436,7 +449,7 @@ class DeepMind:
             if memory_sql_manager is not None:
                 self.user_profile_service.set_memory_sql_manager(memory_sql_manager)
                 # 登记当前事件用户与群聊到账本
-                ledger_sender_id, ledger_sender_name = self._get_event_sender_identity(event)
+                ledger_sender_id, ledger_sender_name = current_sender_id, current_sender_name
                 if ledger_sender_id and ledger_sender_id.lower() not in {
                     "unknown", "user", "assistant", "none", "null", "0",
                 }:
@@ -469,12 +482,11 @@ class DeepMind:
                             f"sender_id={ledger_sender_id} 耗时毫秒={ledger_elapsed_ms} 错误={ledger_e}",
                             exc_info=True,
                         )
-            memory_scope = await self.plugin_context.resolve_memory_scope_from_event(event)
             await self.user_profile_service.refresh_session_profiles(
                 session_id=session_id,
                 chat_records=unprocessed_chat_records,
-                fallback_sender_id=str(getattr(event, "sender_id", "") or ""),
-                fallback_sender_name=str(getattr(event, "sender_name", "") or ""),
+                fallback_sender_id=current_sender_id,
+                fallback_sender_name=current_sender_name,
                 memory_scope=memory_scope,
             )
         except Exception as e:
@@ -803,8 +815,12 @@ class DeepMind:
                     for sid, state in self._reflection_states.items()
                     if int(state.get("pending_turns", 0)) > 0
                     and not bool(state.get("processing", False))
-                    and (now - float(state.get("last_activity_at", 0.0)))
-                    >= float(self._reflection_idle_seconds)
+                    and now >= float(state.get("retry_after", 0.0))
+                    and (
+                        bool(state.get("important_reasons"))
+                        or int(state.get("pending_turns", 0)) >= self._reflection_turn_threshold
+                        or (now - float(state.get("last_activity_at", 0.0))) >= float(self._reflection_idle_seconds)
+                    )
                 ]
             if session_ids:
                 self.logger.info(
@@ -931,9 +947,10 @@ class DeepMind:
         if hasattr(event, "angelmemory_context") and getattr(event, "angelmemory_context", None):
             try:
                 context_data = json.loads(event.angelmemory_context)
-                if isinstance(context_data, dict):
+                if isinstance(context_data, dict) and context_data.get("session_id") == session_id:
                     memory_context = {
                         "session_id": context_data.get("session_id", session_id),
+                        "recall_time": context_data.get("recall_time", 0.0),
                         "query": context_data.get("recall_query", ""),
                         "user_list": context_data.get("user_list", []),
                         "raw_chat_records": context_data.get("raw_chat_records", []),
@@ -946,10 +963,8 @@ class DeepMind:
             except (json.JSONDecodeError, TypeError, KeyError):
                 memory_context = {}
 
-        try:
-            memory_scope = await self.plugin_context.resolve_memory_scope_from_event(event)
-        except Exception:
-            memory_scope = "public"
+        # Identity failure must stop reflection rather than writing to a shared domain.
+        memory_scope = await self.plugin_context.resolve_memory_scope_from_event(event)
 
         try:
             persona_name = await self.plugin_context.get_event_persona_name(event)
@@ -1019,6 +1034,11 @@ class DeepMind:
             self.logger.debug(f"[反思调度] 本轮无消息入池 session={session_id}")
             return
         now = time.time()
+        important_reason = ""
+        if getattr(self, "_important_memory_immediate", True) and any(
+            record.get("role") == "user" for record in turn_records
+        ):
+            important_reason = classify_important_memory(reflection_input.latest_user_text)
 
         async with self._reflection_state_lock:
             state = self._reflection_states.setdefault(
@@ -1029,6 +1049,8 @@ class DeepMind:
                     "records": [],
                     "latest_input": None,
                     "processing": False,
+                    "important_reasons": [],
+                    "retry_after": 0.0,
                 },
             )
             merged = list(state.get("records", [])) + list(turn_records)
@@ -1039,95 +1061,100 @@ class DeepMind:
             state["pending_turns"] = int(state.get("pending_turns", 0)) + 1
             state["last_activity_at"] = now
             state["latest_input"] = reflection_input
+            if important_reason:
+                reasons = state.setdefault("important_reasons", [])
+                if important_reason not in reasons:
+                    reasons.append(important_reason)
+                # A new important fact can retry immediately after a previous failure.
+                state["retry_after"] = 0.0
             self.logger.info(
                 f"[反思调度] 入缓冲 session={session_id} "
                 f"pending_turns={state['pending_turns']} records={len(state['records'])}"
             )
 
     async def _trigger_reflection_if_needed(self, session_id: str, reason: str) -> bool:
-        now = time.time()
-        payload: Dict[str, Any] = {}
-        async with self._reflection_state_lock:
-            state = self._reflection_states.get(session_id)
-            if not state:
-                return False
-            if bool(state.get("processing", False)):
-                return False
+        completed_any = False
+        while True:
+            now = time.time()
+            async with self._reflection_state_lock:
+                state = self._reflection_states.get(session_id)
+                if not state or state.get("processing"):
+                    return completed_any
+                if now < float(state.get("retry_after", 0.0)):
+                    return completed_any
+                pending_turns = int(state.get("pending_turns", 0))
+                important_reasons = list(state.get("important_reasons", []))
+                idle_elapsed = now - float(state.get("last_activity_at", 0.0))
+                if pending_turns <= 0 or not (
+                    important_reasons
+                    or pending_turns >= self._reflection_turn_threshold
+                    or idle_elapsed >= self._reflection_idle_seconds
+                ):
+                    return completed_any
+                latest_input = state.get("latest_input")
+                if latest_input is None:
+                    return completed_any
+                payload = {
+                    "reflection_input": latest_input,
+                    "historical_chat_records": list(state.get("records", [])),
+                    "consumed_turns": pending_turns,
+                    "important_reasons": important_reasons,
+                }
+                state.update(processing=True, pending_turns=0, records=[], important_reasons=[])
 
-            pending_turns = int(state.get("pending_turns", 0))
-            if pending_turns <= 0:
-                return False
-            idle_elapsed = now - float(state.get("last_activity_at", 0.0))
-            meets_count = pending_turns >= int(self._reflection_turn_threshold)
-            meets_idle = idle_elapsed >= float(self._reflection_idle_seconds)
-            if not (meets_count or meets_idle):
-                if reason == "count":
-                    self.logger.debug(
-                        f"[反思调度] 未触发 session={session_id} "
-                        f"pending={pending_turns}/{self._reflection_turn_threshold} "
-                        f"idle={int(idle_elapsed)}s/{self._reflection_idle_seconds}s"
-                    )
-                return False
-
-            state["processing"] = True
-            latest_input = state.get("latest_input")
-            if latest_input is None:
-                state["processing"] = False
-                return False
-            payload = {
-                "reflection_input": latest_input,
-                "historical_chat_records": list(state.get("records", [])),
-                "consumed_turns": pending_turns,
-            }
-            state["pending_turns"] = 0
-            state["records"] = []
-
-        historical_chat_text = ""
-        try:
-            historical_chat_text, _ = self.prompt_builder.format_chat_records(
-                payload.get("historical_chat_records", [])
-            )
-        except Exception as e:
-            self.logger.warning(f"格式化反思聊天记录失败，降级为空: {e}")
-            historical_chat_text = ""
-
-        self.logger.info(
-            f"[反思调度] 触发 reason={reason} session={session_id} "
-            f"turns={payload.get('consumed_turns', 0)} "
-            f"records={len(payload.get('historical_chat_records', []))}"
-        )
-        success = await get_feedback_queue().submit(
-            {
-                "feedback_fn": self._execute_async_analysis_task,
-                "session_id": session_id,
-                "payload": {
-                    "reflection_input": payload.get("reflection_input"),
-                    "historical_chat_text_override": historical_chat_text,
-                },
-            }
-        )
-
-        async with self._reflection_state_lock:
-            state = self._reflection_states.get(session_id)
-            if not state:
-                return bool(success)
-            state["processing"] = False
-            # 若执行失败，恢复已消费的轮次与记录，避免丢失待反思上下文。
-            if not bool(success):
-                state["pending_turns"] = int(state.get("pending_turns", 0)) + int(
-                    payload.get("consumed_turns", 0) or 0
+            success = False
+            followup = False
+            try:
+                historical_chat_text, _ = self.prompt_builder.format_chat_records(
+                    payload["historical_chat_records"]
                 )
-                restored = list(state.get("records", [])) + list(
-                    payload.get("historical_chat_records", [])
+                trigger = "important:" + ",".join(important_reasons) if important_reasons else reason
+                self.logger.info(
+                    f"[反思调度] 触发 reason={trigger} session={session_id} "
+                    f"turns={pending_turns} records={len(payload['historical_chat_records'])}"
                 )
-                state["records"] = self._dedupe_and_sort_chat_records(restored)
-                self.logger.warning(
-                    f"[反思调度] 执行失败后回滚 session={session_id} "
-                    f"pending_turns={state['pending_turns']} records={len(state['records'])}"
-                )
-            else:
-                self.logger.info(f"[反思调度] 完成 session={session_id}")
-        return bool(success)
+                success = bool(await get_feedback_queue().submit({
+                    "feedback_fn": self._execute_async_analysis_task,
+                    "session_id": session_id,
+                    "payload": {
+                        "reflection_input": latest_input,
+                        "historical_chat_text_override": historical_chat_text,
+                    },
+                }))
+            except asyncio.CancelledError:
+                # finally restores the unsaved batch before lifecycle cancellation propagates.
+                raise
+            except Exception as exc:
+                self.logger.error(f"[反思调度] 失败 session={session_id} 错误={exc}", exc_info=True)
+            finally:
+                async with self._reflection_state_lock:
+                    state = self._reflection_states.get(session_id)
+                    if state is not None:
+                        state["processing"] = False
+                        if success:
+                            state["retry_after"] = 0.0
+                            followup = bool(state.get("important_reasons")) or (
+                                int(state.get("pending_turns", 0)) >= self._reflection_turn_threshold
+                            )
+                            self.logger.info(f"[反思调度] 完成 session={session_id}")
+                        else:
+                            state["pending_turns"] = int(state.get("pending_turns", 0)) + pending_turns
+                            state["records"] = self._dedupe_and_sort_chat_records(
+                                list(payload["historical_chat_records"]) + list(state.get("records", []))
+                            )
+                            state["important_reasons"] = list(dict.fromkeys(
+                                important_reasons + list(state.get("important_reasons", []))
+                            ))
+                            state["retry_after"] = time.time() + 30.0
+                            self.logger.warning(
+                                f"[反思调度] 失败后回滚 session={session_id} "
+                                f"pending={state['pending_turns']}，30秒后允许重试"
+                            )
+            completed_any = completed_any or success
+            if not success or not followup:
+                return completed_any
+            # Consume facts that arrived during the last model call, without another message.
+            reason = "pending"
 
     async def _execute_async_analysis_task(
         self,
@@ -1145,6 +1172,10 @@ class DeepMind:
             session_id = str(getattr(reflection_input, "session_id", "") or "").strip()
             if not session_id:
                 return False
+            memory_scope = str(getattr(reflection_input, "memory_scope", "") or "").strip()
+            expected_scope = self.plugin_context.resolve_memory_scope(session_id)
+            if memory_scope != expected_scope:
+                raise ValueError("反思记忆域与捕获的会话身份不一致，已拒绝执行")
             self.logger.info(
                 f"[反思执行] 开始 session={session_id} "
                 f"user_len={len(str(getattr(reflection_input, 'latest_user_text', '') or ''))} "
@@ -1175,42 +1206,79 @@ class DeepMind:
             raw_memories_data = context_data.get("raw_memories", [])
             core_topic = context_data.get("core_topic", "")
 
-            # 将原始数据转换为记忆对象
-            from ..llm_memory.models.data_models import BaseMemory
+            # Tools may have created or replaced facts after the request snapshot.
+            # Refresh every attempt, including retries after partially committed feedback.
+            original_recalled_ids = {
+                str(item.get("id", "")).strip()
+                for item in raw_memories_data
+                if isinstance(item, dict) and item.get("id")
+            }
+            current_ids = list(original_recalled_ids)
+            sql_manager = self.plugin_context.get_component("memory_sql_manager")
+            if sql_manager is not None:
+                captured_at = float(context_data.get("recall_time", 0.0) or 0.0)
 
-            long_term_memories = []
-            for memory_dict in raw_memories_data:
-                try:
-                    memory = BaseMemory.from_dict(memory_dict)
-                    if memory:
-                        long_term_memories.append(memory)
-                except Exception as e:
-                    self.logger.error(f"转换记忆对象失败: {e}")
+                def recent_scope_ids():
+                    with sql_manager._connect() as conn:
+                        return [
+                            str(row[0])
+                            for row in conn.execute(
+                                "SELECT id FROM memory_records WHERE memory_scope=? AND updated_at>=? "
+                                "ORDER BY updated_at DESC,id LIMIT 32",
+                                (memory_scope, captured_at),
+                            )
+                        ]
+
+                current_ids.extend(await asyncio.to_thread(recent_scope_ids))
+            long_term_memories = (
+                await self.memory_system.get_memories_by_ids(
+                    list(dict.fromkeys(current_ids)), memory_scope=memory_scope
+                )
+                if self.memory_system and current_ids
+                else []
+            )
+            long_term_memories = [
+                memory
+                for memory in long_term_memories
+                if getattr(memory, "memory_scope", "public") == memory_scope
+            ]
+            actual_recalled_ids = original_recalled_ids & {
+                memory.id for memory in long_term_memories
+            }
+            if sql_manager is not None:
+                memory_id_mapping = {
+                    sql_manager.register_short_id(memory.id): memory.id
+                    for memory in long_term_memories
+                }
+            else:
+                memory_id_mapping = MemoryIDResolver.generate_id_mapping(
+                    [memory.to_dict() for memory in long_term_memories]
+                )
 
             # 获取主LLM的最终回答
             response_text = str(
                 getattr(reflection_input, "latest_assistant_text", "") or ""
             )
 
-
-            # 从上下文数据中获取ID映射表
-            memory_id_mapping = context_data.get("memory_id_mapping", {})
-
             # 构建反思提示词（只传递记忆数据，不传递笔记）
             # system 放固定指南、user 放本次数据，便于命中提示词缓存
-            system_prompt, prompt = SmallModelPromptBuilder.build_post_hoc_analysis_prompts(
-                historical_query=historical_chat_text,
-                main_llm_response=response_text,
-                raw_memories=long_term_memories,
-                core_topic=core_topic,
-                memory_id_mapping=memory_id_mapping,
-                config=self.config,
+            system_prompt, prompt = (
+                SmallModelPromptBuilder.build_post_hoc_analysis_prompts(
+                    historical_query=historical_chat_text,
+                    main_llm_response=response_text,
+                    raw_memories=long_term_memories,
+                    core_topic=core_topic,
+                    memory_id_mapping={
+                        full_id: short_id
+                        for short_id, full_id in memory_id_mapping.items()
+                    },
+                    config=self.config,
+                )
             )
 
             self.logger.info(
                 f"[反思执行] 最终提示词 session={session_id} "
-                f"system_len={len(system_prompt)} prompt_len={len(prompt)}\n"
-                f"{system_prompt}\n\n{prompt}"
+                f"system_len={len(system_prompt)} prompt_len={len(prompt)}"
             )
             trace_id = self.reflection_trace.record_start(
                 session_id, self.provider_id, prompt, system_prompt
@@ -1270,7 +1338,11 @@ class DeepMind:
             feedback_data = full_json_data.get("feedback_data", {})
 
             # --- 灵魂状态更新 (Feedback Loop) ---
-            if hasattr(self, "soul") and self.soul and "soul_state_code" in full_json_data:
+            if (
+                hasattr(self, "soul")
+                and self.soul
+                and "soul_state_code" in full_json_data
+            ):
                 state_code = full_json_data.get("soul_state_code", "0000")
                 if len(state_code) == 4:
                     try:
@@ -1280,12 +1352,11 @@ class DeepMind:
                         # 1111 觉醒: 话多(Expression+), 飞升(Creativity+), 查阅历史(Recall+), 吸收新知(Impression+)
 
                         self.soul.adjust(state_code, mode="reflect")
-                        self.logger.info(f"🧘 灵魂反思 ({state_code}): {self.soul.get_state_description()}")
+                        self.logger.info(
+                            f"🧘 灵魂反思 ({state_code}): {self.soul.get_state_description()}"
+                        )
                     except ValueError:
                         self.logger.warning(f"无效的灵魂状态代码: {state_code}")
-
-            # ID解析：使用映射表将LLM返回的短ID翻译回长ID
-            memory_id_mapping = context_data.get("memory_id_mapping", {})
 
             if "useful_memory_ids" in feedback_data:
                 # 使用映射表将短ID翻译回长ID
@@ -1293,7 +1364,13 @@ class DeepMind:
                 long_ids = [
                     memory_id_mapping.get(short_id, short_id) for short_id in short_ids
                 ]
-                feedback_data["useful_memory_ids"] = long_ids
+                # Newly saved tool facts are context for deduplication, not recalls
+                # used by the original response, so they must not be reinforced.
+                feedback_data["useful_memory_ids"] = [
+                    memory_id
+                    for memory_id in long_ids
+                    if memory_id in actual_recalled_ids
+                ]
             else:
                 self.logger.error(
                     "feedback_data中没有useful_memory_ids字段"
@@ -1347,18 +1424,24 @@ class DeepMind:
             #    (以及我们之前讨论过的，让 feedback 返回新创建的对象)
             newly_created_memories = []
             if self.memory_system:
-                # 从反思输入载体获取 persona_name
-                persona_name = getattr(reflection_input, "persona_name", "")
-                memory_scope = self.plugin_context.resolve_memory_scope(
-                    session_id, persona_name=persona_name
-                )
+                # Use the validated immutable scope captured with this queued turn.
                 # 直接异步调用
-                newly_created_memories = await self.memory_system.feedback(
-                    useful_memory_ids=feedback_data.get("useful_memory_ids", []),
-                    recalled_memory_ids=[mem.id for mem in (long_term_memories or []) if getattr(mem, "id", None)],
-                    memory_actions=memory_actions_normalized,
-                    memory_scope=memory_scope,
-                )
+                with learning_source(
+                    "auto_learning", session_id=session_id,
+                    excerpt=historical_chat_text_override or getattr(reflection_input, "latest_user_text", ""),
+                    message_ids=[
+                        record.get("message_id") or record.get("msg_id")
+                        for record in getattr(reflection_input, "chat_records", [])
+                        if isinstance(record, dict) and record.get("role") == "user"
+                        and (record.get("message_id") or record.get("msg_id"))
+                    ],
+                ):
+                    newly_created_memories = await self.memory_system.feedback(
+                        useful_memory_ids=feedback_data.get("useful_memory_ids", []),
+                        recalled_memory_ids=list(actual_recalled_ids),
+                        memory_actions=memory_actions_normalized,
+                        memory_scope=memory_scope,
+                    )
 
             # 2. 更新会话工作缓存
             # 获取有用的旧记忆

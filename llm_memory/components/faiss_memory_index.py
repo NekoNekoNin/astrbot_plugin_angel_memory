@@ -272,7 +272,9 @@ class FaissTextIndex:
                 f"任务名=批量向量化 index={self.name} provider_id={self.provider_id} "
                 f"原因=嵌入结果为空 条数={len(clean_rows)}"
             )
-            return
+            raise RuntimeError("Memory index embedding returned no vectors")
+        if len(embeddings) != len(clean_rows):
+            raise RuntimeError("Memory index embedding count does not match source rows")
 
         vectors = self._normalize(np.asarray(embeddings, dtype="float32"))
         dimension = int(vectors.shape[1])

@@ -93,7 +93,7 @@ class SimpleMemoryRuntime:
         memory_ids: List[str],
         memory_scope: Optional[str] = None,
     ) -> List[BaseMemory]:
-        memories = await self._manager.get_memories_by_ids(memory_ids)
+        memories = await self._manager.get_memories_by_ids(memory_ids, memory_scope=memory_scope)
         return self._filter_and_order_memories(
             memories=memories,
             memory_ids=memory_ids,
@@ -153,10 +153,7 @@ class SimpleMemoryRuntime:
                 continue
             if scope:
                 mem_scope = str(getattr(memory, "memory_scope", "public") or "public").strip()
-                if scope == "public":
-                    if mem_scope != "public":
-                        continue
-                elif mem_scope not in {scope, "public"}:
+                if mem_scope != scope:
                     continue
             ordered.append(memory)
         return ordered

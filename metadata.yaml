@@ -1,6 +1,6 @@
 name: astrbot_plugin_angel_memory
-display_name: 天使之魂
-description: "赋予AI动态演化的人格、长期记忆与自主学习能力，将聊天工具升级为有生命感的AI伙伴。"
+display_name: NekoNekoNin · 天使之魂增强版
 author: kawayiYokami
-version: 1.6.14
-repo: https://github.com/kawayiYokami/astrbot_plugin_angel_memory
+version: 1.6.16+timely.4
+desc: 在原版天使之魂基础上增强长期记忆、自动学习、会话隔离与纠正撤销，让重要信息可追溯、可恢复。
+repo: https://github.com/NekoNekoNin/astrbot_plugin_angel_memory

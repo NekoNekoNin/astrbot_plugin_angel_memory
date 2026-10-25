@@ -67,6 +67,45 @@ class DeepMindSleepService:
             deepmind.logger.info("[淘汰审查] 跳过（无候选）")
             return self._empty_recycle_result()
 
+        # 后台维护也遵守会话边界：不同域的正文不能进入同一次 LLM 请求。
+        scoped_candidates: Dict[str, List[BaseMemory]] = {}
+        invalid_count = 0
+        for memory in candidates:
+            scope = str(getattr(memory, "memory_scope", "") or "").strip()
+            if not scope:
+                invalid_count += 1
+                continue
+            scoped_candidates.setdefault(scope, []).append(memory)
+
+        summary = self._empty_recycle_result()
+        summary["candidates"] = len(candidates)
+        summary["undecided"] = invalid_count
+        summary["skipped"] = bool(invalid_count)
+        traces: Dict[str, List[str]] = {
+            "prompt": [], "system_prompt": [], "response": [], "error": []
+        }
+        for scope, batch in scoped_candidates.items():
+            result = await self._review_retirement_batch(batch)
+            for field in ("deleted", "promoted", "undecided", "cost_ms"):
+                summary[field] += int(result.get(field, 0) or 0)
+            summary["skipped"] = summary["skipped"] or bool(result.get("skipped"))
+            for field, entries in traces.items():
+                text = str(result.get(field, "") or "")
+                if text:
+                    entries.append(f"[记忆域 {scope}]\n{text}")
+        for field, entries in traces.items():
+            summary[field] = "\n\n".join(entries)
+        if invalid_count:
+            deepmind.logger.warning(
+                f"[淘汰审查] 跳过 任务=缺失记忆域 候选数={invalid_count}"
+            )
+        return summary
+
+    async def _review_retirement_batch(
+        self, candidates: Sequence[BaseMemory]
+    ) -> Dict[str, Any]:
+        """只审查同一记忆域的候选；失败仅跳过该域。"""
+        deepmind = self.deepmind
         deepmind.logger.info(f"[淘汰审查] 开始 候选数={len(candidates)}")
         review_start = time.time()
         try:

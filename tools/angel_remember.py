@@ -2,6 +2,8 @@ from typing import List, Optional
 from astrbot.api import FunctionTool
 from astrbot.api.event import AstrMessageEvent
 from dataclasses import dataclass, field
+from ..llm_memory.utils.note_scope import require_session_scope
+from ..llm_memory.components.memory_history import learning_source
 
 try:
     from astrbot.api import logger
@@ -132,9 +134,7 @@ class CoreMemoryRememberTool(FunctionTool):
             memory_runtime = plugin_context.get_component("memory_runtime")
             if not memory_runtime:
                 raise ValueError("memory_runtime 未在 PluginContext 中注册。")
-            memory_scope = await plugin_context.resolve_memory_scope_from_event(event)
-            if not isinstance(memory_scope, str):
-                memory_scope = str(memory_scope)
+            memory_scope = require_session_scope(await plugin_context.resolve_memory_scope_from_event(event))
         except Exception as e:
             self.logger.error(f"{self.name}: 无法获取上下文信息: {e}")
             return "错误：无法确定当前会话，记忆写入已拒绝。"
@@ -150,19 +150,30 @@ class CoreMemoryRememberTool(FunctionTool):
                 if not full_id:
                     return f"错误：未找到短 ID「{short_id}」对应的记忆，请确认 ID 正确。"
                 resolved_source_ids.append(full_id)
+            source_memories = await memory_runtime.get_memories_by_ids(
+                resolved_source_ids, memory_scope=memory_scope
+            )
+            if {str(item.id) for item in source_memories} != set(resolved_source_ids):
+                return "错误：源记忆不存在于当前会话，更新或合并已拒绝。"
 
         # --- 执行动作 ---
+        source_message_id = getattr(getattr(event, "message_obj", None), "message_id", "")
         try:
             if action == "create":
-                memory_id = await memory_runtime.remember(
-                    memory_type=memory_type,
-                    judgment=judgment,
-                    reasoning=reasoning,
-                    tags=tags,
-                    strength=50,
-                    is_active=True,
-                    memory_scope=memory_scope,
-                )
+                with learning_source(
+                    "explicit_remember", session_id=event.unified_msg_origin,
+                    excerpt=event.get_message_str(),
+                    message_ids=[source_message_id] if source_message_id else [],
+                ):
+                    memory_id = await memory_runtime.remember(
+                        memory_type=memory_type,
+                        judgment=judgment,
+                        reasoning=reasoning,
+                        tags=tags,
+                        strength=50,
+                        is_active=True,
+                        memory_scope=memory_scope,
+                    )
                 short_id = ""
                 if memory_sql_manager:
                     short_id = memory_sql_manager.get_short_id(str(memory_id))
@@ -187,12 +198,17 @@ class CoreMemoryRememberTool(FunctionTool):
                         },
                     }
                 ]
-                created_memories = await memory_runtime.feedback(
-                    useful_memory_ids=[],
-                    recalled_memory_ids=[],
-                    memory_actions=memory_actions,
-                    memory_scope=memory_scope,
-                )
+                with learning_source(
+                    "explicit_remember", session_id=event.unified_msg_origin,
+                    excerpt=event.get_message_str(),
+                    message_ids=[source_message_id] if source_message_id else [],
+                ):
+                    created_memories = await memory_runtime.feedback(
+                        useful_memory_ids=[],
+                        recalled_memory_ids=[],
+                        memory_actions=memory_actions,
+                        memory_scope=memory_scope,
+                    )
                 # 为新记忆注册短 ID
                 new_short_id = ""
                 if created_memories and memory_sql_manager:

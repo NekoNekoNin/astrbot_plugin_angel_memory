@@ -273,7 +273,7 @@ class PluginContext:
         return self._conversation_scope_map.copy()
 
     def resolve_memory_scope(self, conversation_id: str, persona_name: str = "") -> str:
-        """解析当前记忆域：优先人格名键，其次会话ID键，未命中返回 public。"""
+        """按完整统一会话标识隔离记忆；人格或旧映射不能合并不同会话。"""
         scope, _, _ = self.resolve_memory_scope_with_source(
             conversation_id, persona_name=persona_name
         )
@@ -282,19 +282,14 @@ class PluginContext:
     def resolve_memory_scope_with_source(
         self, conversation_id: str, persona_name: str = ""
     ) -> Tuple[str, str, str]:
-        """解析记忆域并返回命中来源：scope, matched_by, matched_key。"""
+        """返回稳定的会话域，保留旧公共数据但不将其归属给任何新会话。"""
+        import hashlib
+
         normalized_id = str(conversation_id or "").strip()
         if not normalized_id:
             raise ValueError("conversation_id 为空，无法解析 memory_scope")
-        normalized_persona = str(persona_name or "").strip()
-        if normalized_persona:
-            scope_by_persona = self._conversation_scope_map.get(normalized_persona, "")
-            if scope_by_persona:
-                return scope_by_persona, "persona", normalized_persona
-        scope_by_conversation = self._conversation_scope_map.get(normalized_id, "")
-        if scope_by_conversation:
-            return scope_by_conversation, "conversation", normalized_id
-        return "public", "default", "public"
+        scope = "session_" + hashlib.sha256(normalized_id.encode("utf-8")).hexdigest()
+        return scope, "session", normalized_id
 
     @staticmethod
     def _normalize_persona_identifier(raw_value: Any) -> str:
@@ -397,7 +392,6 @@ class PluginContext:
         """从事件直接解析 memory_scope。"""
         return self.resolve_memory_scope(
             self.get_event_conversation_id(event),
-            persona_name=await self.get_event_persona_name(event),
         )
 
     def get_config(

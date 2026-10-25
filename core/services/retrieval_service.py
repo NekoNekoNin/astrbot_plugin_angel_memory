@@ -42,6 +42,8 @@ class DeepMindRetrievalService:
         self, event: AstrMessageEvent, query: str, precompute_vectors: bool = False
     ) -> Dict[str, Any]:
         deepmind = self.deepmind
+        # Resolve before any retrieval; missing identity must never fall back to public.
+        memory_scope = await deepmind.plugin_context.resolve_memory_scope_from_event(event)
 
         if precompute_vectors:
             memory_query, memory_vector = (
@@ -56,7 +58,6 @@ class DeepMindRetrievalService:
         long_term_memories = []
         if deepmind.memory_system:
             try:
-                memory_scope = await deepmind.plugin_context.resolve_memory_scope_from_event(event)
                 rag_fields = deepmind.query_processor.extract_rag_fields(event)
                 entities = rag_fields.get("entities", [])
 
@@ -111,6 +112,7 @@ class DeepMindRetrievalService:
                 query=note_query,
                 recall_count=deepmind.note_candidate_top_k,
                 top_k=deepmind.note_candidate_top_k,
+                memory_scope=memory_scope,
             )
 
         memory_id_mapping = {}

@@ -84,7 +84,7 @@ class MemoryManager:
             keep_ids,
         )
 
-    async def reinforce_memories(self, memory_ids: List[str]):
+    async def reinforce_memories(self, memory_ids: List[str], memory_scope: Optional[str] = None):
         """
         强化记忆强度（清醒模式）。
 
@@ -94,7 +94,7 @@ class MemoryManager:
             memory_ids: 要强化的记忆ID列表
         """
         if self.memory_sql_manager is not None:
-            await self.memory_sql_manager.reinforce_memories(memory_ids, delta=1)
+            await self.memory_sql_manager.reinforce_memories(memory_ids, delta=1, memory_scope=memory_scope)
             return
 
         for memory_id in memory_ids:
@@ -103,6 +103,10 @@ class MemoryManager:
                 result = self.collection.get(where={"id": memory_id}, limit=1)
                 if result and result["metadatas"] and result["ids"]:
                     current_meta = result["metadatas"][0]
+                    if memory_scope is not None and not self._is_scope_allowed(
+                        current_meta.get("memory_scope"), memory_scope
+                    ):
+                        continue
                     current_strength = current_meta.get("strength", 1)
                     current_useful_count = int(current_meta.get("useful_count", 0) or 0)
                     current_useful_score = float(current_meta.get("useful_score", 0.0) or 0.0)
@@ -134,19 +138,14 @@ class MemoryManager:
         if not scope:
             raise ValueError("memory_scope 为空，拒绝执行检索")
 
-        if scope == "public":
-            return {"memory_scope": "public"}
-
-        return {"$or": [{"memory_scope": scope}, {"memory_scope": "public"}]}
+        return {"memory_scope": scope}
 
     @staticmethod
     def _is_scope_allowed(memory_scope: str, target_scope: str) -> bool:
-        """检查给定的 memory_scope 是否在 target_scope 允许范围内（含 public 通配）"""
-        scope = str(memory_scope or "").strip() or "public"
+        """Check exact ownership without treating legacy public data as shared."""
+        scope = str(memory_scope or "").strip()
         target = str(target_scope or "").strip()
-        if target == "public":
-            return scope == "public"
-        return scope in {target, "public"}
+        return bool(scope and target and scope == target)
 
     @staticmethod
     def _safe_parse_timestamp(value, default: float) -> float:
@@ -254,7 +253,9 @@ class MemoryManager:
             if not id_scores:
                 return []
             ordered_ids = [mid for mid, _ in id_scores]
-            sql_memories = await self.memory_sql_manager.get_memories_by_ids(ordered_ids)
+            sql_memories = await self.memory_sql_manager.get_memories_by_ids(
+                ordered_ids, memory_scope=memory_scope
+            )
             filtered: List[BaseMemory] = []
             for mem in sql_memories:
                 if not self._is_scope_allowed(getattr(mem, "memory_scope", "public"), memory_scope):
@@ -427,6 +428,7 @@ class MemoryManager:
         new_judgment: str,
         new_reasoning: str,
         new_tags: List[str],
+        memory_scope: Optional[str] = None,
     ) -> BaseMemory:
         """
         记忆合并方法 - LLM驱动的记忆抽象化（中文核心概念）
@@ -496,16 +498,18 @@ class MemoryManager:
         if len(memories_to_merge) < 1:
             raise ValidationError("没有找到可被替换的有效旧记忆")
 
-        non_public_scopes = {
+        scopes = {
             str(getattr(memory_obj, "memory_scope", "public") or "public").strip()
             for memory_obj in memories_to_merge
-            if str(getattr(memory_obj, "memory_scope", "public") or "public").strip() != "public"
         }
-        if len(non_public_scopes) > 1:
+        if len(scopes) > 1 or (
+            memory_scope is not None
+            and scopes != {str(memory_scope).strip()}
+        ):
             raise ValidationError(
-                "禁止合并来自不同私有分类域的记忆：检测到多个非 public memory_scope。"
+                "Memory merge sources must belong to the current conversation"
             )
-        merged_scope = next(iter(non_public_scopes), "public")
+        merged_scope = next(iter(scopes))
         try:
             target_memory_type = MemoryType(str(new_memory_type or "").strip())
         except ValueError:
@@ -566,6 +570,14 @@ class MemoryManager:
         3. 执行合并动作
         """
         if self.memory_sql_manager is not None:
+            allowed_index_ids = set()
+            if self.memory_index_collection is not None:
+                for action in memory_actions or []:
+                    if str(action.get("action", "")).strip().lower() in {"merge", "updata"}:
+                        source_ids = action.get("source_memory_ids", [])
+                        if isinstance(source_ids, list):
+                            existing = await self.memory_sql_manager.get_memories_by_ids(source_ids, memory_scope=memory_scope)
+                            allowed_index_ids.update(memory.id for memory in existing)
             result = await self.memory_sql_manager.process_feedback(
                 useful_memory_ids=useful_memory_ids,
                 recalled_memory_ids=recalled_memory_ids,
@@ -579,7 +591,10 @@ class MemoryManager:
                         continue
                     source_memory_ids = action.get("source_memory_ids", [])
                     if isinstance(source_memory_ids, list):
-                        ids_to_delete.extend([str(mid) for mid in source_memory_ids if str(mid).strip()])
+                        ids_to_delete.extend([
+                            str(mid) for mid in source_memory_ids
+                            if str(mid).strip() and str(mid) in allowed_index_ids
+                        ])
 
                 if ids_to_delete:
                     try:
@@ -637,7 +652,7 @@ class MemoryManager:
 
         if useful_memory_ids:
             # 强化记忆强度
-            await self.reinforce_memories(useful_memory_ids)
+            await self.reinforce_memories(useful_memory_ids, memory_scope=resolved_scope)
 
         # 1.5 被召回但无用：仅衰减 T1（兼容向量直连链路）
         if recalled_memory_ids:
@@ -650,6 +665,8 @@ class MemoryManager:
                         if not result or not result.get("metadatas") or not result.get("ids"):
                             continue
                         meta = result["metadatas"][0] or {}
+                        if not self._is_scope_allowed(meta.get("memory_scope"), resolved_scope):
+                            continue
                         if bool(meta.get("is_active", False)):
                             continue
                         useful_score = float(meta.get("useful_score", 0.0) or 0.0)
@@ -716,6 +733,7 @@ class MemoryManager:
                 new_judgment=judgment,
                 new_reasoning=reasoning,
                 new_tags=tags,
+                memory_scope=resolved_scope,
             )
             if merged_memory:
                 created_memories.append(merged_memory)

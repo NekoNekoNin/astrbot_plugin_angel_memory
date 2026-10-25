@@ -134,13 +134,9 @@ class MemoryHandler:
         clauses = [{"memory_type": self.memory_type.value}]
 
         scope = str(memory_scope or "").strip()
-        if scope:
-            if scope == "public":
-                clauses.append({"memory_scope": "public"})
-            else:
-                clauses.append(
-                    {"$or": [{"memory_scope": scope}, {"memory_scope": "public"}]}
-                )
+        if not scope:
+            raise ValueError("memory_scope is required for memory recall")
+        clauses.append({"memory_scope": scope})
 
         # 新架构下 recall 统一走中央 SQL 的 tags 召回。
         if self.memory_sql_manager is not None:
@@ -160,7 +156,7 @@ class MemoryHandler:
             recalled = await self.memory_sql_manager.recall_by_tags(
                 query=query,
                 limit=limit,
-                memory_scope=memory_scope or "public",
+                memory_scope=scope,
                 vector_scores=vector_scores,
             )
             filtered = [

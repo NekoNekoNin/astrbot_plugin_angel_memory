@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 from .id_service import IDService
 from ..parser.note_chunker import chunk_file
 from ..components.note_chunk_search import NoteChunkSearchEngine
+from ..utils.note_scope import note_scope_from_path, require_session_scope
 
 try:
     from astrbot.api import logger
@@ -60,14 +61,19 @@ class NoteService:
         max_results: int = 10,
         tag_filter: List[str] = None,
         threshold: float = 0.5,
+        memory_scope: Optional[str] = None,
     ) -> List[Dict]:
         del tag_filter, threshold
+        try:
+            memory_scope = require_session_scope(memory_scope)
+        except ValueError:
+            return []
         search_engine = self._get_chunk_search_engine()
         if search_engine is None:
             return []
-        raw_results = await search_engine.search_async(query=query, limit=max_results)
+        raw_results = await search_engine.search_async(query=query, limit=max_results, memory_scope=memory_scope)
         results = self._format_chunk_results(raw_results)
-        return self._enrich_with_short_ids(results)
+        return self._enrich_with_short_ids(results, memory_scope=memory_scope)
 
     async def search_notes_by_top_k(
         self,
@@ -76,14 +82,19 @@ class NoteService:
         top_k: int = 20,
         tag_filter: List[str] = None,
         vector: Optional[List[float]] = None,
+        memory_scope: Optional[str] = None,
     ) -> List[Dict]:
         del tag_filter, vector
+        try:
+            memory_scope = require_session_scope(memory_scope)
+        except ValueError:
+            return []
         search_engine = self._get_chunk_search_engine()
         if search_engine is None:
             return []
-        raw_results = await search_engine.search_async(query=query, limit=max(0, int(top_k)))
+        raw_results = await search_engine.search_async(query=query, limit=max(0, int(top_k)), memory_scope=memory_scope)
         results = self._format_chunk_results(raw_results)
-        return self._enrich_with_short_ids(results)
+        return self._enrich_with_short_ids(results, memory_scope=memory_scope)
 
     def _get_chunk_search_engine(self) -> Optional[NoteChunkSearchEngine]:
         """获取切片搜索引擎实例"""
@@ -106,6 +117,7 @@ class NoteService:
                 "content": content,
                 "metadata": {
                     "source_file_path": source_file_path,
+                    "memory_scope": str(r.get("memory_scope") or "legacy_unattributed"),
                     "file_id": str(r.get("file_id") or ""),
                     "line_start": line_start,
                     "line_end": line_end,
@@ -117,7 +129,7 @@ class NoteService:
             })
         return formatted
 
-    def _enrich_with_short_ids(self, results: List[Dict]) -> List[Dict]:
+    def _enrich_with_short_ids(self, results: List[Dict], memory_scope: Optional[str] = None) -> List[Dict]:
         """为结果补充 note_short_id"""
         if not results:
             return results
@@ -129,7 +141,7 @@ class NoteService:
         paths = list({r.get("metadata", {}).get("source_file_path", "") for r in results if r.get("metadata", {}).get("source_file_path")})
         if not paths:
             return results
-        path_to_short_id = memory_sql_manager.get_short_ids_by_paths_sync(paths)
+        path_to_short_id = memory_sql_manager.get_short_ids_by_paths_sync(paths, memory_scope=memory_scope)
         for r in results:
             path = r.get("metadata", {}).get("source_file_path", "")
             if path in path_to_short_id:
@@ -141,9 +153,10 @@ class NoteService:
         query: str,
         recall_count: int = 100,
         vector: Optional[List[float]] = None,
+        memory_scope: Optional[str] = None,
     ) -> List[Dict]:
         del recall_count, vector
-        return await self.search_notes(query=query)
+        return await self.search_notes(query=query, memory_scope=memory_scope)
 
     def get_note(self, note_id: str) -> Dict:
         raise NoteOperationError(
@@ -157,6 +170,7 @@ class NoteService:
         relative_path: str = None,
         *,
         update_search_index: bool = True,
+        memory_scope: Optional[str] = None,
     ) -> tuple:
         import time
 
@@ -169,6 +183,11 @@ class NoteService:
         file_timestamp = int(file_obj.stat().st_mtime)
         if relative_path is None:
             relative_path = file_obj.name
+        path_scope = note_scope_from_path(relative_path)
+        if memory_scope is not None and require_session_scope(memory_scope) != path_scope:
+            raise NoteOperationError("笔记路径与所属会话不一致，写入已拒绝。")
+        # 文件监控与全量重建只从工具生成的会话目录恢复归属，旧文件留在隔离区。
+        memory_scope = path_scope
 
         if file_obj.suffix.lower() not in {".md", ".txt"}:
             self.logger.info(f"跳过不支持的笔记文件类型: {relative_path}")
@@ -192,6 +211,7 @@ class NoteService:
             heading_h1=heading_h1,
             total_lines=total_lines,
             updated_at=file_timestamp,
+            memory_scope=memory_scope,
         )
         timings["store_total"] = (time.time() - t0) * 1000
 
@@ -203,6 +223,7 @@ class NoteService:
             str(file_id),
             update_search_index=update_search_index,
             timings=timings,
+            memory_scope=memory_scope,
         )
         timings["chunk_total"] = (time.time() - t0) * 1000
         timings["chunk_count"] = chunk_count
@@ -232,6 +253,7 @@ class NoteService:
         *,
         update_search_index: bool = True,
         timings: Optional[Dict[str, float]] = None,
+        memory_scope: str = "legacy_unattributed",
     ) -> int:
         """对文件执行切片，写入切片库，并可选更新搜索索引。"""
         if Path(file_path).suffix.lower() not in {".md", ".txt"}:
@@ -260,6 +282,7 @@ class NoteService:
                             file_id=file_id,
                             source_file_path=relative_path,
                             chunks=chunks,
+                            memory_scope=memory_scope,
                         )
                         if timings is not None:
                             timings["chunk_store"] = (time.time() - t0) * 1000
@@ -274,6 +297,7 @@ class NoteService:
                         file_id=file_id,
                         source_file_path=relative_path,
                         chunks=chunks,
+                        memory_scope=memory_scope,
                     )
                     if timings is not None:
                         timings["chunk_search_index"] = (time.time() - t0) * 1000

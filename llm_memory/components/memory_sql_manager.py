@@ -25,6 +25,7 @@ from ..utils.user_profile import (
 from ..service.memory_decay_policy import MemoryDecayConfig, MemoryDecayPolicy
 from .bm25_retriever import TantivyBM25Retriever
 from .hybrid_retrieval_engine import HybridRetrievalEngine
+from .memory_history import HistoryConflict, MemoryHistory
 
 
 class MemorySqlManager:
@@ -43,7 +44,7 @@ class MemorySqlManager:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._fts_lock = threading.Lock()
+        self._fts_lock = threading.RLock()
         self._tag_names: set[str] = set()
         self._fts_rebuild_required = False
         self.decay_policy = MemoryDecayPolicy(decay_config)
@@ -131,6 +132,7 @@ class MemorySqlManager:
                     note_short_id INTEGER UNIQUE,
                     file_id TEXT NOT NULL,
                     source_file_path TEXT NOT NULL,
+                    memory_scope TEXT NOT NULL DEFAULT 'legacy_unattributed',
                     heading_h1 TEXT,
                     heading_h2 TEXT,
                     heading_h3 TEXT,
@@ -187,6 +189,9 @@ class MemorySqlManager:
             # 兼容迁移：note_index_records 补充 total_lines 列
             note_columns = cur.execute("PRAGMA table_info(note_index_records)").fetchall()
             column_names = {str(row[1]) for row in note_columns}
+            if "memory_scope" not in column_names:
+                cur.execute("ALTER TABLE note_index_records ADD COLUMN memory_scope TEXT NOT NULL DEFAULT 'legacy_unattributed'")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_note_scope ON note_index_records(memory_scope)")
             if "note_short_id" not in column_names:
                 cur.execute("ALTER TABLE note_index_records ADD COLUMN note_short_id INTEGER")
             if "total_lines" not in column_names:
@@ -251,6 +256,7 @@ class MemorySqlManager:
                     ON note_index_records(note_short_id)
                 """
             )
+            MemoryHistory.initialize(conn)
             conn.commit()
 
     def _load_tag_cache(self) -> None:
@@ -317,7 +323,7 @@ class MemorySqlManager:
                 mapping[short_id] = full_id
         return mapping
 
-    def get_short_ids_by_paths_sync(self, paths: List[str]) -> Dict[str, int]:
+    def get_short_ids_by_paths_sync(self, paths: List[str], memory_scope: Optional[str] = None) -> Dict[str, int]:
         """根据 source_file_path 列表查询对应的 note_short_id。
 
         Returns:
@@ -325,13 +331,15 @@ class MemorySqlManager:
         """
         if not paths:
             return {}
+        scope_clause = " AND memory_scope = ?" if memory_scope is not None else ""
+        params = list(paths) + ([memory_scope] if memory_scope is not None else [])
         with self._connect() as conn:
             placeholders = ",".join(["?" for _ in paths])
             rows = conn.execute(
                 f"SELECT source_file_path, note_short_id FROM note_index_records "
                 f"WHERE source_file_path IN ({placeholders}) AND note_short_id IS NOT NULL "
-                f"ORDER BY note_short_id ASC",
-                tuple(paths),
+                f"{scope_clause} ORDER BY note_short_id ASC",
+                tuple(params),
             ).fetchall()
         result: Dict[str, int] = {}
         for row in rows:
@@ -571,36 +579,39 @@ class MemorySqlManager:
         )
 
     def _sync_memory_fts_by_id_sync(self, memory_id: str) -> None:
-        if not self._fts_ready:
-            return
-        mid = str(memory_id or "").strip()
-        if not mid:
-            return
-        memories = self._get_memories_by_ids_sync([mid])
-        if not memories:
-            self._fts_retriever.delete_memory(mid)
-            return
-        mem = memories[0]
-        self._fts_retriever.upsert_memory(
-            item_id=mem.id,
-            tags=getattr(mem, "tags", []) or [],
-            judgment=str(getattr(mem, "judgment", "") or ""),
-        )
+        # Tantivy permits one writer per index, including concurrent learning.
+        with self._fts_lock:
+            if not self._fts_ready:
+                return
+            mid = str(memory_id or "").strip()
+            if not mid:
+                return
+            memories = self._get_memories_by_ids_sync([mid])
+            if not memories:
+                self._fts_retriever.delete_memory(mid)
+                return
+            mem = memories[0]
+            self._fts_retriever.upsert_memory(
+                item_id=mem.id,
+                tags=getattr(mem, "tags", []) or [],
+                judgment=str(getattr(mem, "judgment", "") or ""),
+            )
 
     def _sync_memory_fts_batch_sync(
         self,
         upsert_ids: Optional[List[str]] = None,
         delete_ids: Optional[List[str]] = None,
     ) -> None:
-        if not self._fts_ready:
-            return
-        upsert_list = [str(x).strip() for x in (upsert_ids or []) if str(x).strip()]
-        delete_list = [str(x).strip() for x in (delete_ids or []) if str(x).strip()]
-        if delete_list:
-            for memory_id in delete_list:
-                self._fts_retriever.delete_memory(memory_id)
-        for memory_id in upsert_list:
-            self._sync_memory_fts_by_id_sync(memory_id)
+        with self._fts_lock:
+            if not self._fts_ready:
+                return
+            upsert_list = [str(x).strip() for x in (upsert_ids or []) if str(x).strip()]
+            delete_list = [str(x).strip() for x in (delete_ids or []) if str(x).strip()]
+            if delete_list:
+                for memory_id in delete_list:
+                    self._fts_retriever.delete_memory(memory_id)
+            for memory_id in upsert_list:
+                self._sync_memory_fts_by_id_sync(memory_id)
 
     async def audit_and_repair_fts_indexes(self, sample_size: int = 50) -> Dict[str, Any]:
         return await asyncio.to_thread(self._audit_and_repair_fts_indexes_sync, sample_size)
@@ -659,17 +670,13 @@ class MemorySqlManager:
     @staticmethod
     def _scope_sql(memory_scope: str, alias: str = "mr") -> Tuple[str, List[str]]:
         scope = MemorySqlManager._normalize_scope(memory_scope)
-        if scope == "public":
-            return f"{alias}.memory_scope = ?", ["public"]
-        return f"({alias}.memory_scope = ? OR {alias}.memory_scope = 'public')", [scope]
+        return f"{alias}.memory_scope = ?", [scope]
 
     @staticmethod
     def _is_scope_allowed(memory_scope: str, target_scope: str) -> bool:
-        scope = str(memory_scope or "").strip() or "public"
+        scope = str(memory_scope or "").strip()
         target = str(target_scope or "").strip()
-        if target == "public":
-            return scope == "public"
-        return scope in {target, "public"}
+        return bool(scope and target and scope == target)
 
     @staticmethod
     def _row_to_memory(row: sqlite3.Row, tags: List[str]) -> BaseMemory:
@@ -818,6 +825,7 @@ class MemorySqlManager:
         heading_h1: str = "",
         total_lines: int = 0,
         updated_at: Optional[float] = None,
+        memory_scope: str = "legacy_unattributed",
     ) -> Dict[str, int]:
         return await asyncio.to_thread(
             self._upsert_note_file_entry_sync,
@@ -826,6 +834,7 @@ class MemorySqlManager:
             heading_h1,
             total_lines,
             updated_at,
+            memory_scope,
         )
 
     def _upsert_note_file_entry_sync(
@@ -835,6 +844,7 @@ class MemorySqlManager:
         heading_h1: str = "",
         total_lines: int = 0,
         updated_at: Optional[float] = None,
+        memory_scope: str = "legacy_unattributed",
     ) -> Dict[str, int]:
         fid = str(file_id or "").strip()
         rel_path = str(source_file_path or "").replace("\\", "/").strip().lstrip("/")
@@ -844,6 +854,8 @@ class MemorySqlManager:
 
         source_id = f"note_file_{fid}"
         with self._connect() as conn:
+            if "memory_scope" not in {str(row[1]) for row in conn.execute("PRAGMA table_info(note_index_records)")}:
+                conn.execute("ALTER TABLE note_index_records ADD COLUMN memory_scope TEXT NOT NULL DEFAULT 'legacy_unattributed'")
             existing = conn.execute(
                 "SELECT note_short_id FROM note_index_records WHERE source_id = ?",
                 (source_id,),
@@ -877,14 +889,16 @@ class MemorySqlManager:
                 """
                 INSERT INTO note_index_records(
                     source_id, note_short_id, file_id, source_file_path,
+                    memory_scope,
                     heading_h1, heading_h2, heading_h3,
                     heading_h4, heading_h5, heading_h6,
                     total_lines, updated_at
-                ) VALUES (?, ?, ?, ?, ?, '', '', '', '', '', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, '', '', '', '', '', ?, ?)
                 ON CONFLICT(source_id) DO UPDATE SET
                     note_short_id=excluded.note_short_id,
                     file_id=excluded.file_id,
                     source_file_path=excluded.source_file_path,
+                    memory_scope=excluded.memory_scope,
                     heading_h1=excluded.heading_h1,
                     heading_h2='',
                     heading_h3='',
@@ -899,6 +913,7 @@ class MemorySqlManager:
                     note_short_id,
                     fid,
                     rel_path,
+                    memory_scope,
                     heading_1,
                     int(total_lines or 0),
                     float(updated_at or time.time()),
@@ -940,19 +955,20 @@ class MemorySqlManager:
             ).strip()
         return doc_text_map
 
-    async def get_note_index_by_short_id(self, note_short_id: int) -> Optional[Dict[str, Any]]:
-        return await asyncio.to_thread(self._get_note_index_by_short_id_sync, note_short_id)
+    async def get_note_index_by_short_id(self, note_short_id: int, memory_scope: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(self._get_note_index_by_short_id_sync, note_short_id, memory_scope)
 
-    def _get_note_index_by_short_id_sync(self, note_short_id: int) -> Optional[Dict[str, Any]]:
+    def _get_note_index_by_short_id_sync(self, note_short_id: int, memory_scope: Optional[str] = None) -> Optional[Dict[str, Any]]:
         sid = int(note_short_id)
         with self._connect() as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT
                     nir.source_id,
                     nir.note_short_id,
                     nir.file_id,
                     nir.source_file_path,
+                    nir.memory_scope,
                     nir.heading_h1,
                     nir.heading_h2,
                     nir.heading_h3,
@@ -963,9 +979,10 @@ class MemorySqlManager:
                     nir.updated_at
                 FROM note_index_records nir
                 WHERE nir.note_short_id = ?
+                    {"AND nir.memory_scope = ?" if memory_scope is not None else ""}
                 LIMIT 1
                 """,
-                (sid,),
+                (sid, memory_scope) if memory_scope is not None else (sid,),
             ).fetchone()
         return dict(row) if row else None
 
@@ -1107,8 +1124,16 @@ class MemorySqlManager:
                     now,
                 ),
             )
-            self._upsert_tags_and_bind(conn, memory.id, normalized_tags)
-            conn.commit()
+            try:
+                self._upsert_tags_and_bind(conn, memory.id, normalized_tags)
+                MemoryHistory.record(
+                    conn, "create", scope, [], MemoryHistory.snapshot(conn, [memory.id])
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                self._load_tag_cache()
+                raise
         self._sync_memory_fts_by_id_sync(memory.id)
         self.register_short_id(memory.id)
 
@@ -1177,7 +1202,7 @@ class MemorySqlManager:
             {"scanned": int, "deduped": int, "upserted": int, "failed": int}
         """
         scanned = len(memories or [])
-        deduped_map: Dict[str, Dict[str, Any]] = {}
+        deduped_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
         failed = 0
 
         for item in memories or []:
@@ -1189,16 +1214,18 @@ class MemorySqlManager:
             except (TypeError, ValueError):
                 created_at = 0.0
 
-            current = deduped_map.get(judgment)
+            memory_scope = self._normalize_scope(item.get("memory_scope", "public"))
+            key = (memory_scope, judgment)
+            current = deduped_map.get(key)
             if current is None:
-                deduped_map[judgment] = dict(item)
-                deduped_map[judgment]["created_at"] = created_at
+                deduped_map[key] = dict(item)
+                deduped_map[key]["created_at"] = created_at
                 continue
 
             current_created = float(current.get("created_at") or 0)
             if created_at >= current_created:
-                deduped_map[judgment] = dict(item)
-                deduped_map[judgment]["created_at"] = created_at
+                deduped_map[key] = dict(item)
+                deduped_map[key]["created_at"] = created_at
 
         upserted = 0
         now = time.time()
@@ -1206,7 +1233,7 @@ class MemorySqlManager:
         fts_delete_ids: List[str] = []
 
         with self._connect() as conn:
-            for judgment, raw in deduped_map.items():
+            for (_, judgment), raw in deduped_map.items():
                 try:
                     created_at = float(raw.get("created_at") or now)
                     normalized_tags = self._normalize_tags(BaseMemory._parse_tags(raw.get("tags", [])))
@@ -1223,10 +1250,10 @@ class MemorySqlManager:
                         """
                         SELECT id, created_at
                         FROM memory_records
-                        WHERE judgment = ?
+                        WHERE judgment = ? AND memory_scope = ?
                         ORDER BY created_at DESC, updated_at DESC
                         """,
-                        (judgment,),
+                        (judgment, memory_scope),
                     ).fetchall()
 
                     if existing_rows:
@@ -1479,6 +1506,19 @@ class MemorySqlManager:
         if not text:
             return []
 
+        scope = self._normalize_scope(memory_scope)
+        with self._connect() as conn:
+            allowed_ids = {
+                str(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM memory_records WHERE memory_scope = ?", (scope,)
+                ).fetchall()
+            }
+        if not allowed_ids:
+            return []
+        if vector_scores is not None:
+            vector_scores = {mid: score for mid, score in vector_scores.items() if mid in allowed_ids}
+
         self._ensure_fts_ready_sync()
         candidate_limit = max(20, int(limit) * 20)
         bm25_limit = max(50, int(limit) * 30)
@@ -1488,16 +1528,21 @@ class MemorySqlManager:
             candidate_limit=candidate_limit,
             bm25_limit=bm25_limit,
             vector_scores=vector_scores,
-            bm25_only_search=lambda q, k: self._fts_retriever.search_memory_bm25_only(query=q, limit=k),
-            fusion_search=lambda q, k, bk, scores: self._fts_retriever.search_memory(
+            bm25_only_search=lambda q, k: [
+                hit for hit in self._fts_retriever.search_memory_bm25_only(query=q, limit=k)
+                if str(hit.get("id") or "") in allowed_ids
+            ],
+            fusion_search=lambda q, k, bk, scores: [hit for hit in self._fts_retriever.search_memory(
                 query=q,
                 limit=k,
                 fts_limit=bk,
                 fts_weight=0.3,
                 vector_weight=0.7,
                 vector_scores=scores,
+            ) if str(hit.get("id") or "") in allowed_ids],
+            build_doc_text_map=lambda ids: self._build_memory_doc_text_map_by_ids(
+                [mid for mid in ids if mid in allowed_ids]
             ),
-            build_doc_text_map=self._build_memory_doc_text_map_by_ids,
         )
         if not hits:
             return []
@@ -1537,13 +1582,17 @@ class MemorySqlManager:
                 break
         return ordered
 
-    async def reinforce_memories(self, memory_ids: List[str], delta: int = 1) -> None:
+    async def reinforce_memories(
+        self, memory_ids: List[str], delta: int = 1, memory_scope: Optional[str] = None
+    ) -> None:
         ids = [str(mid).strip() for mid in (memory_ids or []) if str(mid).strip()]
         if not ids:
             return
         placeholders = ",".join(["?" for _ in ids])
         now = time.time()
         score_delta = float(self.decay_policy.config.consolidate_speed)
+        scope_clause = " AND memory_scope = ?" if memory_scope is not None else ""
+        scope_args = [self._normalize_scope(memory_scope)] if memory_scope is not None else []
         with self._connect() as conn:
             conn.execute(
                 f"""
@@ -1553,13 +1602,15 @@ class MemorySqlManager:
                     useful_score = useful_score + ?,
                     last_recalled_at = ?,
                     updated_at = ?
-                WHERE id IN ({placeholders})
+                WHERE id IN ({placeholders}){scope_clause}
                 """,
-                tuple([int(delta), score_delta, now, now, *ids]),
+                tuple([int(delta), score_delta, now, now, *ids, *scope_args]),
             )
             conn.commit()
 
-    async def decay_memories(self, memory_ids: List[str], delta: int = 1) -> None:
+    async def decay_memories(
+        self, memory_ids: List[str], delta: int = 1, memory_scope: Optional[str] = None
+    ) -> None:
         """
         兼容旧接口：仅对 T1（待证档）执行“召回无用衰减”。
         """
@@ -1570,6 +1621,8 @@ class MemorySqlManager:
         now = time.time()
         tier1_min_score = float(self.decay_policy.config.tier0_threshold)
         tier1_max_score = float(self.decay_policy.config.tier1_threshold)
+        scope_clause = " AND memory_scope = ?" if memory_scope is not None else ""
+        scope_args = [self._normalize_scope(memory_scope)] if memory_scope is not None else []
         with self._connect() as conn:
             conn.execute(
                 f"""
@@ -1580,13 +1633,16 @@ class MemorySqlManager:
                   AND is_active = 0
                   AND useful_score >= ?
                   AND useful_score < ?
+                  {scope_clause}
                 """,
-                tuple([int(delta), int(delta), now, tier1_min_score, tier1_max_score, *ids]),
+                tuple([int(delta), int(delta), now, *ids, tier1_min_score, tier1_max_score, *scope_args]),
             )
             conn.commit()
 
-    async def decay_recalled_but_useless(self, memory_ids: List[str], delta: int = 1) -> None:
-        await self.decay_memories(memory_ids, delta=delta)
+    async def decay_recalled_but_useless(
+        self, memory_ids: List[str], delta: int = 1, memory_scope: Optional[str] = None
+    ) -> None:
+        await self.decay_memories(memory_ids, delta=delta, memory_scope=memory_scope)
 
     async def natural_decay_tier0(self, now_ts: Optional[float] = None) -> int:
         """
@@ -1753,11 +1809,15 @@ class MemorySqlManager:
             keep_ids,
         )
 
-    def _get_memories_by_ids_sync(self, memory_ids: List[str]) -> List[BaseMemory]:
+    def _get_memories_by_ids_sync(
+        self, memory_ids: List[str], memory_scope: Optional[str] = None
+    ) -> List[BaseMemory]:
         ids = [str(mid).strip() for mid in (memory_ids or []) if str(mid).strip()]
         if not ids:
             return []
         placeholders = ",".join(["?" for _ in ids])
+        scope_clause = " AND memory_scope = ?" if memory_scope is not None else ""
+        scope_args = [self._normalize_scope(memory_scope)] if memory_scope is not None else []
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
@@ -1765,15 +1825,17 @@ class MemorySqlManager:
                        is_active, useful_count, useful_score, last_recalled_at,
                        memory_scope, created_at
                 FROM memory_records
-                WHERE id IN ({placeholders})
+                WHERE id IN ({placeholders}){scope_clause}
                 """,
-                tuple(ids),
+                tuple([*ids, *scope_args]),
             ).fetchall()
             tags_map = self._fetch_tags_for_memory_ids(conn, [str(row["id"]) for row in rows])
         return [self._row_to_memory(row, tags_map.get(str(row["id"]), [])) for row in rows]
 
-    async def get_memories_by_ids(self, memory_ids: List[str]) -> List[BaseMemory]:
-        return await asyncio.to_thread(self._get_memories_by_ids_sync, memory_ids)
+    async def get_memories_by_ids(
+        self, memory_ids: List[str], memory_scope: Optional[str] = None
+    ) -> List[BaseMemory]:
+        return await asyncio.to_thread(self._get_memories_by_ids_sync, memory_ids, memory_scope)
 
     async def recall_user_profiles(
         self,
@@ -1867,15 +1929,14 @@ class MemorySqlManager:
         if len(memories) < 2:
             return None
 
-        non_public_scopes = {
+        scopes = {
             str(mem.memory_scope or "public").strip()
             for mem in memories
-            if str(mem.memory_scope or "public").strip() != "public"
         }
-        if len(non_public_scopes) > 1:
+        if len(scopes) > 1:
             raise ValidationError("禁止合并不同私有分类域的记忆")
 
-        merged_scope = next(iter(non_public_scopes), "public")
+        merged_scope = next(iter(scopes))
         first = memories[0]
         merged_strength = sum(mem.strength for mem in memories)
         merged_useful_count = sum(int(getattr(mem, "useful_count", 0) or 0) for mem in memories)
@@ -1899,10 +1960,11 @@ class MemorySqlManager:
 
         ids = [mem.id for mem in memories]
         placeholders = ",".join(["?" for _ in ids])
-        with self._lock:
-            cache_snapshot = set(self._tag_names)
         with self._connect() as conn:
             try:
+                conn.execute("BEGIN IMMEDIATE")
+                before = MemoryHistory.snapshot(conn, ids)
+                self._verify_learning_sources(before, memories)
                 conn.execute(
                     """
                     INSERT INTO memory_records(
@@ -1935,9 +1997,13 @@ class MemorySqlManager:
                     f"DELETE FROM memory_records WHERE id IN ({placeholders})",
                     tuple(ids),
                 )
+                MemoryHistory.record(
+                    conn, "merge", merged_scope, before,
+                    MemoryHistory.snapshot(conn, [new_memory.id]),
+                )
             except Exception:
-                with self._lock:
-                    self._tag_names = cache_snapshot
+                conn.rollback()
+                self._load_tag_cache()
                 raise
         self._sync_memory_fts_batch_sync(
             upsert_ids=[new_memory.id],
@@ -1959,12 +2025,12 @@ class MemorySqlManager:
         useful_ids = [str(x).strip() for x in (useful_memory_ids or []) if str(x).strip()]
         recalled_ids = [str(x).strip() for x in (recalled_memory_ids or []) if str(x).strip()]
         if useful_ids:
-            await self.reinforce_memories(useful_ids, delta=1)
+            await self.reinforce_memories(useful_ids, delta=1, memory_scope=resolved_scope)
         if recalled_ids:
             useful_set = set(useful_ids)
             useless_recalled = [mid for mid in recalled_ids if mid not in useful_set]
             if useless_recalled:
-                await self.decay_recalled_but_useless(useless_recalled, delta=1)
+                await self.decay_recalled_but_useless(useless_recalled, delta=1, memory_scope=resolved_scope)
 
         for action_data in (memory_actions or []):
             action = str(action_data.get("action", "") or "").strip().lower()
@@ -1996,12 +2062,15 @@ class MemorySqlManager:
             source_memory_ids = action_data.get("source_memory_ids", [])
             if not isinstance(source_memory_ids, list) or not source_memory_ids:
                 continue
+            if action == "updata" and len({str(item).strip() for item in source_memory_ids if str(item).strip()}) != 1:
+                raise ValidationError("A correction must reference exactly one source memory")
 
             merged = await asyncio.to_thread(
                 self._merge_action_sync,
                 source_memory_ids,
                 memory_data,
                 resolved_scope,
+                "update" if action == "updata" else "merge",
             )
             if merged:
                 created_memories.append(merged)
@@ -2013,6 +2082,7 @@ class MemorySqlManager:
         source_memory_ids: List[str],
         memory_data: Dict[str, Any],
         resolved_scope: str,
+        history_action: str | None = None,
     ) -> Optional[BaseMemory]:
         source_ids = list(
             dict.fromkeys(
@@ -2027,38 +2097,45 @@ class MemorySqlManager:
         memories = self._get_memories_by_ids_sync(source_ids)
         if not memories:
             return None
+        if {memory.id for memory in memories} != set(source_ids):
+            raise HistoryConflict("部分源记忆已被其他学习替换，请重新读取后再更新。")
 
-        non_public_scopes = {
-            str(mem.memory_scope or "public").strip()
-            for mem in memories
-            if str(mem.memory_scope or "public").strip() != "public"
-        }
-        if len(non_public_scopes) > 1:
-            raise ValidationError("禁止合并不同私有分类域的记忆")
-
-        merged_scope = next(iter(non_public_scopes), resolved_scope)
+        if any(not self._is_scope_allowed(mem.memory_scope, resolved_scope) for mem in memories):
+            raise ValidationError("Memory merge sources must belong to the current conversation")
+        merged_scope = self._normalize_scope(resolved_scope)
         now = time.time()
         new_memory = BaseMemory(
-            memory_type=self._to_memory_type(str(memory_data.get("type") or "knowledge")),
+            memory_type=self._to_memory_type(
+                str(memory_data.get("type") or "knowledge")
+            ),
             judgment=str(memory_data.get("judgment") or "").strip(),
             reasoning=str(memory_data.get("reasoning") or "").strip(),
             tags=self._normalize_tags(memory_data.get("tags") or []),
             id=str(uuid.uuid4()),
             strength=sum(mem.strength for mem in memories),
-            is_active=bool(memory_data.get("is_active", False)),
+            is_active=bool(
+                memory_data.get("is_active", any(mem.is_active for mem in memories))
+            ),
             created_at=now,
             memory_scope=merged_scope,
-            useful_count=sum(int(getattr(mem, "useful_count", 0) or 0) for mem in memories),
-            useful_score=max(float(getattr(mem, "useful_score", 0.0) or 0.0) for mem in memories),
-            last_recalled_at=max(float(getattr(mem, "last_recalled_at", 0.0) or 0.0) for mem in memories),
+            useful_count=sum(
+                int(getattr(mem, "useful_count", 0) or 0) for mem in memories
+            ),
+            useful_score=max(
+                float(getattr(mem, "useful_score", 0.0) or 0.0) for mem in memories
+            ),
+            last_recalled_at=max(
+                float(getattr(mem, "last_recalled_at", 0.0) or 0.0) for mem in memories
+            ),
         )
 
         ids = [mem.id for mem in memories]
         placeholders = ",".join(["?" for _ in ids])
-        with self._lock:
-            cache_snapshot = set(self._tag_names)
         with self._connect() as conn:
             try:
+                conn.execute("BEGIN IMMEDIATE")
+                before = MemoryHistory.snapshot(conn, ids)
+                self._verify_learning_sources(before, memories)
                 conn.execute(
                     """
                     INSERT INTO memory_records(
@@ -2091,15 +2168,33 @@ class MemorySqlManager:
                     f"DELETE FROM memory_records WHERE id IN ({placeholders})",
                     tuple(ids),
                 )
+                MemoryHistory.record(
+                    conn, history_action or ("update" if len(ids) == 1 else "merge"), merged_scope, before,
+                    MemoryHistory.snapshot(conn, [new_memory.id]),
+                )
             except Exception:
-                with self._lock:
-                    self._tag_names = cache_snapshot
+                conn.rollback()
+                self._load_tag_cache()
                 raise
         self._sync_memory_fts_batch_sync(
             upsert_ids=[new_memory.id],
             delete_ids=ids,
         )
         return new_memory
+
+    @staticmethod
+    def _verify_learning_sources(snapshots: List[dict], memories: List[BaseMemory]) -> None:
+        """Refuse merging source rows changed between analysis and write lock."""
+        rows = {item["id"]: item for item in snapshots}
+        if set(rows) != {memory.id for memory in memories}:
+            raise HistoryConflict("源记忆已变更，学习替换已拒绝。")
+        fields = ("judgment", "reasoning", "strength", "is_active", "created_at", "memory_scope", "useful_count", "useful_score", "last_recalled_at")
+        for memory in memories:
+            row = rows[memory.id]
+            if any(row[field] != getattr(memory, field) for field in fields):
+                raise HistoryConflict("源记忆已变更，学习替换已拒绝。")
+            if sorted(row["tags"]) != sorted(memory.tags) or row["memory_type"] != memory.memory_type.value:
+                raise HistoryConflict("源记忆已变更，学习替换已拒绝。")
 
     def close(self) -> None:
         with self._lock:

@@ -105,14 +105,17 @@ class DeepMindInjectionService:
             "以下是系统自动检索的背景上下文（包含记忆、笔记及当前状态）。\n"
             "请利用这些信息辅助回答，但必须遵守以下规则：\n"
             "1. **对话优先**：始终优先响应用户的当前对话内容，记忆和笔记仅作为补充参考。\n"
-            "2. **绝对隐形**：严禁在回复中提及\"soul_state\"、\"系统提示\"、\"XML标签\"等来源信息。\n"
-            "3. **状态保密**：soul_state 仅用于调整你的回复风格，绝不可在回复中泄露或讨论。\n"
-            "4. **自然默契**：你需要记得用户的一切，但要表现得像刚好理解用户所想，而不是正在翻看记忆看板。\n"
+            "2. **会话边界**：这些背景只属于当前会话，不得推断其他群或私聊的经历与关系。\n"
+            "3. **状态用途**：soul_state 仅用于调整回复风格，无需向用户展示内部标签。\n"
+            "4. **如实回答**：记忆可能不完整或过时；没有依据时说明不确定，不编造共同经历。\n"
             "</instruction>"
         )
         system_context_parts.append(instruction)
 
-        if soul_state_values and deepmind.config.enable_soul_system:
+        soul_enabled = getattr(deepmind.config, "enable_soul_system", False)
+        if isinstance(soul_enabled, dict):
+            soul_enabled = soul_enabled.get("enabled") is True
+        if soul_state_values and soul_enabled is True:
             norm_recall = self.normalize_soul_value(
                 "RecallDepth", soul_state_values.get("RecallDepth", 0.5)
             )
@@ -186,13 +189,13 @@ class DeepMindInjectionService:
 
         memory_guide = (
             "【记忆系统】\n"
-            "你拥有长期记忆，应主动使用：\n"
+            "你拥有按当前会话隔离的长期记忆，可按需使用：\n"
             "- 对话牵涉过去的事、拿不准的细节，先用 angel_recall 检索再回答\n"
             "- 出现值得长期记住的信息（群友稳定特征、重要约定、关键事实）时，用 angel_remember 记下："
             "新信息 create，发现错误或过时及时 update，重复 merge\n"
-            "- 宁可多记一条后续修正，不可漏记\n"
+            "- 只保存当前会话中有明确依据、值得长期保留的信息；不要把猜测当成事实\n"
             "- 想起的内容自然融入当前回答，对话焦点始终跟随用户\n"
-            "- 表现得这些信息你本来就知道，工具和系统提示只是获取手段"
+            "- 检索不到或信息有冲突时说明不确定，不能声称记得未找到的事情"
         )
         request.system_prompt = (
             f"{request.system_prompt}\n\n{memory_guide}" if request.system_prompt else memory_guide

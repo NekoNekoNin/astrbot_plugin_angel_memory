@@ -1,27 +1,27 @@
 {
   "provider_id": {
     "type": "string",
-    "description": "[核心模型设置] 用于记忆整理的LLM提供商ID",
+    "description": "基础 · 记忆整理模型",
     "_special": "select_provider",
     "default": "",
-    "hint": "建议为拥有思考能力的模型。留空则只使用基础记忆功能。"
+    "hint": "选择已配置的聊天模型，用于记忆整理与反馈；留空时不具备完整的自动整理能力。"
   },
   "retrieval": {
     "type": "object",
-    "description": "[向量化检索] 检索模型与重排配置",
-    "hint": "检索会按能力自动选择三档策略（BM25直出 / 向量融合 / 候选重排）。即使不使用向量化模型，也能获得非常好的体验，向量并非必须。",
+    "description": "检索 · 关键词、向量与重排",
+    "hint": "关键词检索可独立使用；嵌入和重排按提供商能力可选，效果与延迟取决于模型和资料。",
     "items": {
       "embedding_provider_id": {
         "type": "string",
         "description": "用于向量化的嵌入模型提供商ID（可选）",
         "default": "",
-        "hint": "并非必须；本项目已内置强关键词检索与精准生成链路，实测向量带来的额外提升通常较小。"
+        "hint": "填写已配置的嵌入模型提供商 ID；留空时仍可使用关键词检索。不能用不支持嵌入的聊天模型代替。"
       },
       "rerank_provider_id": {
         "type": "string",
         "description": "用于检索重排的提供商ID（推荐）",
         "default": "",
-        "hint": "推荐使用，检索效果提升明显；不依赖嵌入模型，BM25 候选也可以直接重排。留空则自动尝试复用 provider_id，若不可用则降级为非重排策略。"
+        "hint": "可选，用于重新排列检索候选；留空时按运行时的可用能力回退。请核对提供商是否支持重排。"
       },
       "enable_local_embedding": {
         "type": "bool",
@@ -57,18 +57,58 @@
   },
   "conversation_scope_map": {
     "type": "text",
-    "description": "[记忆分类] 文本键到记忆分类域的映射（人格名优先，其次会话ID）",
+    "description": "[旧版兼容项] 会话映射（严格隔离版不使用共享映射）",
     "default": "{}",
     "editor_mode": true,
     "editor_language": "json",
     "editor_theme": "vs-dark",
-    "hint": "键为人格名（优先匹配）或会话ID，值为记忆分类域；未命中时默认 public。scope 名仅允许字母、数字、中文、下划线和短横线。"
+    "hint": "保留旧版配置兼容；增强版使用完整会话来源隔离记忆，不通过此项合并群或私聊。",
+    "invisible": true
   },
   "memory_behavior": {
     "type": "object",
-    "description": "[记忆行为参数] 记忆系统的行为配置",
+    "description": "学习 · 整理时机与记忆行为",
     "hint": "控制记忆处理的各种参数，影响记忆的生成、保存和巩固。",
     "items": {
+      "important_memory_immediate": {
+        "type": "bool",
+        "description": "重要信息优先整理",
+        "default": true,
+        "hint": "本轮用户明确要求记住、表达具体稳定偏好、提出约定或更正信息时，回复后立即提交后台整理；仍由模型筛选，不会把每句话直接保存。"
+      },
+      "reflection_turn_threshold": {
+        "type": "int",
+        "description": "普通聊天累计整理轮数",
+        "default": 3,
+        "hint": "普通内容累计到此轮数后整理，建议范围 1–20；重要信息优先整理不受此轮数限制。",
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
+      },
+      "reflection_idle_seconds": {
+        "type": "int",
+        "description": "停聊后整理等待秒数",
+        "default": 30,
+        "hint": "有未整理内容且会话空闲达到此时间后可整理；扫描周期和模型繁忙情况会影响实际完成时间。",
+        "slider": {
+          "min": 10,
+          "max": 600,
+          "step": 1
+        }
+      },
+      "reflection_tick_seconds": {
+        "type": "int",
+        "description": "待整理内容检查周期秒数",
+        "default": 10,
+        "hint": "最小 10 秒；检查当前会话的重要信息、已累计轮数和空闲内容。",
+        "slider": {
+          "min": 10,
+          "max": 300,
+          "step": 1
+        }
+      },
       "default_passive_strength": {
         "type": "int",
         "description": "被动记忆的初始强度值",
@@ -140,7 +180,7 @@
   },
   "enable_soul_system": {
     "type": "object",
-    "description": "[灵魂系统] 灵魂状态系统配置",
+    "description": "进阶 · 灵魂状态系统",
     "hint": "启用后会根据AI的精神状态动态调整行为参数（检索量、记忆量、发言长度、创造性）。关闭则使用固定参数，不会在上下文中注入灵魂仪表盘。",
     "items": {
       "enabled": {
@@ -177,7 +217,7 @@
   },
   "note_assistant": {
     "type": "object",
-    "description": "[笔记] 笔记功能配置",
+    "description": "笔记 · 生成与检索",
     "hint": "笔记功能让 AI 在交流与学习中自主整理、归档笔记，并在记忆检索时一并调用笔记知识库。可分别控制「检索」与「生成」两项能力。",
     "items": {
       "enable_recall": {

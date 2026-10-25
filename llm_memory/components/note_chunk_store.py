@@ -56,6 +56,7 @@ class NoteChunkStore:
                     chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     file_id TEXT NOT NULL,
                     source_file_path TEXT NOT NULL,
+                    memory_scope TEXT NOT NULL DEFAULT 'legacy_unattributed',
                     chunk_index INTEGER NOT NULL,
                     line_start INTEGER NOT NULL,
                     line_end INTEGER NOT NULL,
@@ -71,9 +72,13 @@ class NoteChunkStore:
                     ON chunks(source_file_path, chunk_index);
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
+            if "memory_scope" not in columns:
+                conn.execute("ALTER TABLE chunks ADD COLUMN memory_scope TEXT NOT NULL DEFAULT 'legacy_unattributed'")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_scope ON chunks(memory_scope)")
             conn.commit()
 
-    def upsert_chunks(self, file_id: str, source_file_path: str, chunks: List[Dict]) -> int:
+    def upsert_chunks(self, file_id: str, source_file_path: str, chunks: List[Dict], *, memory_scope: str = "legacy_unattributed") -> int:
         """
         写入切片（先删旧数据再插入新数据）。
 
@@ -100,6 +105,7 @@ class NoteChunkStore:
                 (
                     file_id,
                     source_file_path,
+                    memory_scope,
                     chunk["chunk_index"],
                     chunk["line_start"],
                     chunk["line_end"],
@@ -110,8 +116,8 @@ class NoteChunkStore:
             ]
             conn.executemany(
                 """
-                INSERT INTO chunks (file_id, source_file_path, chunk_index, line_start, line_end, content, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chunks (file_id, source_file_path, memory_scope, chunk_index, line_start, line_end, content, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -141,7 +147,7 @@ class NoteChunkStore:
         conn = self._get_conn()
         rows = conn.execute(
             """
-            SELECT chunk_id, file_id, source_file_path, chunk_index, line_start, line_end, content, created_at
+            SELECT chunk_id, file_id, source_file_path, memory_scope, chunk_index, line_start, line_end, content, created_at
             FROM chunks
             WHERE source_file_path = ?
             ORDER BY chunk_index ASC
@@ -160,7 +166,7 @@ class NoteChunkStore:
         conn = self._get_conn()
         rows = conn.execute(
             """
-            SELECT chunk_id, file_id, source_file_path, chunk_index, line_start, line_end, content, created_at
+            SELECT chunk_id, file_id, source_file_path, memory_scope, chunk_index, line_start, line_end, content, created_at
             FROM chunks
             WHERE file_id = ?
             ORDER BY chunk_index ASC
@@ -179,7 +185,7 @@ class NoteChunkStore:
         conn = self._get_conn()
         rows = conn.execute(
             """
-            SELECT chunk_id, file_id, source_file_path, chunk_index, line_start, line_end, content, created_at
+            SELECT chunk_id, file_id, source_file_path, memory_scope, chunk_index, line_start, line_end, content, created_at
             FROM chunks
             ORDER BY source_file_path ASC, chunk_index ASC
             """

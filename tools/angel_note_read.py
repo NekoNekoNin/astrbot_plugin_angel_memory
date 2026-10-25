@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from ..llm_memory.utils.note_scope import note_scope_from_path, require_session_scope
 
 from astrbot.api import FunctionTool
 from astrbot.api.event import AstrMessageEvent
@@ -58,14 +59,20 @@ class NoteRecallTool(FunctionTool):
         if not hasattr(event, "plugin_context") or event.plugin_context is None:
             return "错误：无法获取插件上下文。"
         plugin_context = event.plugin_context
+        try:
+            memory_scope = require_session_scope(await plugin_context.resolve_memory_scope_from_event(event))
+        except Exception:
+            return "错误：无法确定当前会话，笔记读取已拒绝。"
 
         memory_sql_manager = plugin_context.get_component("memory_sql_manager")
         if memory_sql_manager is None:
             return "错误：memory_sql_manager 不可用。"
-        row = await memory_sql_manager.get_note_index_by_short_id(int(note_short_id))
+        row = await memory_sql_manager.get_note_index_by_short_id(int(note_short_id), memory_scope=memory_scope)
         if not row:
             return f"错误：未找到 note_short_id={int(note_short_id)} 对应的笔记。"
         rel_path = str(row.get("source_file_path") or "").replace("\\", "/").strip().lstrip("/")
+        if row.get("memory_scope") != memory_scope or note_scope_from_path(rel_path) != memory_scope:
+            return "错误：未找到当前会话的笔记。"
 
         raw_dir = plugin_context.get_path_manager().get_raw_dir()
         target_path = (Path(raw_dir) / rel_path).resolve()

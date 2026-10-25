@@ -252,7 +252,9 @@ class CognitiveService:
             return []
 
         if self.memory_sql_manager is not None:
-            memories = await self.memory_sql_manager.get_memories_by_ids(ids)
+            memories = await self.memory_sql_manager.get_memories_by_ids(
+                ids, memory_scope=memory_scope
+            )
             scope = str(memory_scope or "").strip()
             memory_map = {
                 str(memory.id): memory
@@ -272,10 +274,7 @@ class CognitiveService:
                     mem_scope = str(
                         getattr(memory, "memory_scope", "public") or "public"
                     ).strip()
-                    if scope == "public":
-                        if mem_scope != "public":
-                            continue
-                    elif mem_scope not in {scope, "public"}:
+                    if mem_scope != scope:
                         continue
                 ordered.append(memory)
             return ordered
@@ -305,10 +304,7 @@ class CognitiveService:
                         mem_scope = str(
                             getattr(memory, "memory_scope", "public") or "public"
                         ).strip()
-                        if scope == "public":
-                            if mem_scope != "public":
-                                continue
-                        elif mem_scope not in {scope, "public"}:
+                        if mem_scope != scope:
                             continue
                     ordered.append(memory)
                 return ordered

@@ -98,12 +98,8 @@ class TagsAPI:
             scope_clause = ""
             scope_params: List[Any] = []
             if scope:
-                if scope == "public":
-                    scope_clause = "AND mr.memory_scope = ?"
-                    scope_params = ["public"]
-                else:
-                    scope_clause = "AND (mr.memory_scope = ? OR mr.memory_scope = 'public')"
-                    scope_params = [scope]
+                scope_clause = "AND mr.memory_scope = ?"
+                scope_params = [scope]
 
             sql = f"""
                 SELECT

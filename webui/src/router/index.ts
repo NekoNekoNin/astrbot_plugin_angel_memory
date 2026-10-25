@@ -1,6 +1,7 @@
 import type { RouteRecordRaw } from 'vue-router'
 import OverviewView from '@/views/OverviewView.vue'
 import MemoryBrowseView from '@/views/MemoryBrowseView.vue'
+import LearningHistoryView from '@/views/LearningHistoryView.vue'
 import TagsDebugView from '@/views/TagsDebugView.vue'
 import VectorSearchView from '@/views/VectorSearchView.vue'
 import NoteIndexView from '@/views/NoteIndexView.vue'
@@ -23,6 +24,12 @@ export const routes: RouteRecordRaw[] = [
     name: 'memories',
     component: MemoryBrowseView,
     meta: { title: '记忆浏览', icon: 'lucide:brain' },
+  },
+  {
+    path: '/history',
+    name: 'history',
+    component: LearningHistoryView,
+    meta: { title: '学习记录', icon: 'lucide:history' },
   },
   {
     path: '/profiles',

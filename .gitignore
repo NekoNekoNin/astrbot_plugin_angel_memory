@@ -180,3 +180,26 @@ webui/dist/
 
 # 点开头的工作目录一律无视，需要的自行强制追踪
 .*/
+
+# Local runtime files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+node_modules/
+.env
+.env.*
+!.env.example
+auth.json
+config.toml
+data/
+plugin_data/
+logs/
+*.log
+*.db
+*.db-*
+*.sqlite*
+coverage.xml
+.coverage

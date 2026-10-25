@@ -7,8 +7,10 @@ ComponentFactory - 组件工厂
 
 import subprocess
 import sys
+from copy import deepcopy
 from typing import Dict, Any, Optional
 from pathlib import Path
+from types import SimpleNamespace
 
 try:
     from astrbot.api import logger
@@ -612,13 +614,23 @@ class ComponentFactory:
         # 从PluginContext获取LLM提供商ID
         llm_provider_id = self.plugin_context.get_llm_provider_id()
 
-        # 创建配置对象
-        class Config:
-            def __init__(self, config_dict):
-                for key, value in config_dict.items():
-                    setattr(self, key, value)
-
-        config_obj = Config(self.plugin_context.get_all_config())
+        # 保留全部插件配置，同时把新式嵌套灵魂配置转换成运行时实际读取的字段。
+        # 不能直接把 {"enabled": False} 当作布尔值：非空字典始终为真。
+        config_dict = deepcopy(dict(self.plugin_context.get_all_config()))
+        soul_config = config_dict.get("enable_soul_system", False)
+        if isinstance(soul_config, dict):
+            config_dict["enable_soul_system"] = soul_config.get("enabled") is True
+            for field in (
+                "recall_depth_mid",
+                "impression_depth_mid",
+                "expression_desire_mid",
+                "creativity_mid",
+            ):
+                if field in soul_config:
+                    config_dict[f"soul_{field}"] = soul_config[field]
+        else:
+            config_dict["enable_soul_system"] = soul_config is True
+        config_obj = SimpleNamespace(**config_dict)
 
         deepmind = DeepMind(
             config=config_obj,
